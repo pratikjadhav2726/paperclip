@@ -82,9 +82,17 @@ const mockAccessService = vi.hoisted(() => ({
 const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockTrackRoutineCreated = vi.hoisted(() => vi.fn());
 const mockGetTelemetryClient = vi.hoisted(() => vi.fn());
+const mockWithCompanyRls = vi.hoisted(() =>
+  vi.fn(async (_db: unknown, _companyId: string, operation: (scopedDb: unknown) => Promise<unknown>) =>
+    operation({ scoped: true }),
+  ),
+);
 
 function registerModuleMocks() {
   vi.doMock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
+  vi.doMock("../services/company-rls.js", () => ({
+    withCompanyRls: mockWithCompanyRls,
+  }));
 
   vi.doMock("@paperclipai/shared/telemetry", () => ({
     trackRoutineCreated: mockTrackRoutineCreated,
@@ -139,11 +147,13 @@ describe("routine routes", () => {
     vi.doUnmock("../services/index.js");
     vi.doUnmock("../services/activity-log.js");
     vi.doUnmock("../services/routines.js");
+    vi.doUnmock("../services/company-rls.js");
     vi.doUnmock("../routes/routines.js");
     vi.doUnmock("../routes/authz.js");
     vi.doUnmock("../middleware/index.js");
     registerModuleMocks();
     vi.clearAllMocks();
+    mockWithCompanyRls.mockClear();
     mockGetTelemetryClient.mockReturnValue({ track: vi.fn() });
     mockRoutineService.create.mockResolvedValue(routine);
     mockRoutineService.get.mockResolvedValue(routine);
@@ -177,6 +187,7 @@ describe("routine routes", () => {
 
     expect(res.status).toBe(403);
     expect(res.body.error).toContain("tasks:assign");
+    expect(mockWithCompanyRls).not.toHaveBeenCalled();
     expect(mockRoutineService.create).not.toHaveBeenCalled();
   });
 
@@ -300,6 +311,7 @@ describe("routine routes", () => {
       });
 
     expect(res.status).toBe(201);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), companyId, expect.any(Function));
     expect(mockRoutineService.create).toHaveBeenCalledWith(companyId, expect.objectContaining({
       projectId,
       title: "Daily routine",
@@ -309,5 +321,24 @@ describe("routine routes", () => {
       userId: "board-user",
     });
     expect(mockTrackRoutineCreated).toHaveBeenCalledWith(expect.anything());
+  });
+
+  it("runs routines inside company RLS scope when board has tasks:assign", async () => {
+    mockAccessService.canUser.mockResolvedValue(true);
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+
+    const res = await request(app)
+      .post(`/api/routines/${routineId}/run`)
+      .send({});
+
+    expect(res.status).toBe(202);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), companyId, expect.any(Function));
+    expect(mockRoutineService.runRoutine).toHaveBeenCalledWith(routineId, { source: "manual" });
   });
 });

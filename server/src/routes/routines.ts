@@ -15,6 +15,7 @@ import { assertCompanyAccess, getActorInfo } from "./authz.js";
 import { forbidden, unauthorized } from "../errors.js";
 import { getTelemetryClient } from "../telemetry.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
+import { withCompanyRls } from "../services/company-rls.js";
 
 export function routineRoutes(
   db: Db,
@@ -60,7 +61,11 @@ export function routineRoutes(
   router.get("/companies/:companyId/routines", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    const result = await svc.list(companyId);
+    const result = await withCompanyRls(db, companyId, (scopedDb) =>
+      routineService(scopedDb, {
+        pluginWorkerManager: options.pluginWorkerManager,
+      }).list(companyId),
+    );
     res.json(result);
   });
 
@@ -68,21 +73,27 @@ export function routineRoutes(
     const companyId = req.params.companyId as string;
     await assertBoardCanAssignTasks(req, companyId);
     assertCanManageCompanyRoutine(req, companyId, req.body.assigneeAgentId);
-    const created = await svc.create(companyId, req.body, {
-      agentId: req.actor.type === "agent" ? req.actor.agentId : null,
-      userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
-    });
     const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "routine.created",
-      entityType: "routine",
-      entityId: created.id,
-      details: { title: created.title, assigneeAgentId: created.assigneeAgentId },
+    const created = await withCompanyRls(db, companyId, async (scopedDb) => {
+      const scopedSvc = routineService(scopedDb, {
+        pluginWorkerManager: options.pluginWorkerManager,
+      });
+      const next = await scopedSvc.create(companyId, req.body, {
+        agentId: req.actor.type === "agent" ? req.actor.agentId : null,
+        userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
+      });
+      await logActivity(scopedDb, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "routine.created",
+        entityType: "routine",
+        entityId: next.id,
+        details: { title: next.title, assigneeAgentId: next.assigneeAgentId },
+      });
+      return next;
     });
     const telemetryClient = getTelemetryClient();
     if (telemetryClient) {
@@ -98,7 +109,12 @@ export function routineRoutes(
       return;
     }
     assertCompanyAccess(req, detail.companyId);
-    res.json(detail);
+    const scopedDetail = await withCompanyRls(db, detail.companyId, (scopedDb) =>
+      routineService(scopedDb, {
+        pluginWorkerManager: options.pluginWorkerManager,
+      }).getDetail(req.params.id as string),
+    );
+    res.json(scopedDetail ?? detail);
   });
 
   router.patch("/routines/:id", validate(updateRoutineSchema), async (req, res) => {
@@ -127,21 +143,27 @@ export function routineRoutes(
     ) {
       throw forbidden("Agents can only assign routines to themselves");
     }
-    const updated = await svc.update(routine.id, req.body, {
-      agentId: req.actor.type === "agent" ? req.actor.agentId : null,
-      userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
-    });
     const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: routine.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "routine.updated",
-      entityType: "routine",
-      entityId: routine.id,
-      details: { title: updated?.title ?? routine.title },
+    const updated = await withCompanyRls(db, routine.companyId, async (scopedDb) => {
+      const scopedSvc = routineService(scopedDb, {
+        pluginWorkerManager: options.pluginWorkerManager,
+      });
+      const next = await scopedSvc.update(routine.id, req.body, {
+        agentId: req.actor.type === "agent" ? req.actor.agentId : null,
+        userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
+      });
+      await logActivity(scopedDb, {
+        companyId: routine.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "routine.updated",
+        entityType: "routine",
+        entityId: routine.id,
+        details: { title: next?.title ?? routine.title },
+      });
+      return next;
     });
     res.json(updated);
   });
@@ -154,7 +176,11 @@ export function routineRoutes(
     }
     assertCompanyAccess(req, routine.companyId);
     const limit = Number(req.query.limit ?? 50);
-    const result = await svc.listRuns(routine.id, Number.isFinite(limit) ? limit : 50);
+    const result = await withCompanyRls(db, routine.companyId, (scopedDb) =>
+      routineService(scopedDb, {
+        pluginWorkerManager: options.pluginWorkerManager,
+      }).listRuns(routine.id, Number.isFinite(limit) ? limit : 50),
+    );
     res.json(result);
   });
 
@@ -165,21 +191,27 @@ export function routineRoutes(
       return;
     }
     await assertBoardCanAssignTasks(req, routine.companyId);
-    const created = await svc.createTrigger(routine.id, req.body, {
-      agentId: req.actor.type === "agent" ? req.actor.agentId : null,
-      userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
-    });
     const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: routine.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "routine.trigger_created",
-      entityType: "routine_trigger",
-      entityId: created.trigger.id,
-      details: { routineId: routine.id, kind: created.trigger.kind },
+    const created = await withCompanyRls(db, routine.companyId, async (scopedDb) => {
+      const scopedSvc = routineService(scopedDb, {
+        pluginWorkerManager: options.pluginWorkerManager,
+      });
+      const next = await scopedSvc.createTrigger(routine.id, req.body, {
+        agentId: req.actor.type === "agent" ? req.actor.agentId : null,
+        userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
+      });
+      await logActivity(scopedDb, {
+        companyId: routine.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "routine.trigger_created",
+        entityType: "routine_trigger",
+        entityId: next.trigger.id,
+        details: { routineId: routine.id, kind: next.trigger.kind },
+      });
+      return next;
     });
     res.status(201).json(created);
   });
@@ -196,21 +228,27 @@ export function routineRoutes(
       return;
     }
     await assertBoardCanAssignTasks(req, routine.companyId);
-    const updated = await svc.updateTrigger(trigger.id, req.body, {
-      agentId: req.actor.type === "agent" ? req.actor.agentId : null,
-      userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
-    });
     const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: routine.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "routine.trigger_updated",
-      entityType: "routine_trigger",
-      entityId: trigger.id,
-      details: { routineId: routine.id, kind: updated?.kind ?? trigger.kind },
+    const updated = await withCompanyRls(db, routine.companyId, async (scopedDb) => {
+      const scopedSvc = routineService(scopedDb, {
+        pluginWorkerManager: options.pluginWorkerManager,
+      });
+      const next = await scopedSvc.updateTrigger(trigger.id, req.body, {
+        agentId: req.actor.type === "agent" ? req.actor.agentId : null,
+        userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
+      });
+      await logActivity(scopedDb, {
+        companyId: routine.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "routine.trigger_updated",
+        entityType: "routine_trigger",
+        entityId: trigger.id,
+        details: { routineId: routine.id, kind: next?.kind ?? trigger.kind },
+      });
+      return next;
     });
     res.json(updated);
   });
@@ -226,18 +264,23 @@ export function routineRoutes(
       res.status(404).json({ error: "Routine not found" });
       return;
     }
-    await svc.deleteTrigger(trigger.id);
     const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: routine.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "routine.trigger_deleted",
-      entityType: "routine_trigger",
-      entityId: trigger.id,
-      details: { routineId: routine.id, kind: trigger.kind },
+    await withCompanyRls(db, routine.companyId, async (scopedDb) => {
+      const scopedSvc = routineService(scopedDb, {
+        pluginWorkerManager: options.pluginWorkerManager,
+      });
+      await scopedSvc.deleteTrigger(trigger.id);
+      await logActivity(scopedDb, {
+        companyId: routine.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "routine.trigger_deleted",
+        entityType: "routine_trigger",
+        entityId: trigger.id,
+        details: { routineId: routine.id, kind: trigger.kind },
+      });
     });
     res.status(204).end();
   });
@@ -256,21 +299,27 @@ export function routineRoutes(
         res.status(404).json({ error: "Routine not found" });
         return;
       }
-      const rotated = await svc.rotateTriggerSecret(trigger.id, {
-        agentId: req.actor.type === "agent" ? req.actor.agentId : null,
-        userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
-      });
       const actor = getActorInfo(req);
-      await logActivity(db, {
-        companyId: routine.companyId,
-        actorType: actor.actorType,
-        actorId: actor.actorId,
-        agentId: actor.agentId,
-        runId: actor.runId,
-        action: "routine.trigger_secret_rotated",
-        entityType: "routine_trigger",
-        entityId: trigger.id,
-        details: { routineId: routine.id },
+      const rotated = await withCompanyRls(db, routine.companyId, async (scopedDb) => {
+        const scopedSvc = routineService(scopedDb, {
+          pluginWorkerManager: options.pluginWorkerManager,
+        });
+        const next = await scopedSvc.rotateTriggerSecret(trigger.id, {
+          agentId: req.actor.type === "agent" ? req.actor.agentId : null,
+          userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
+        });
+        await logActivity(scopedDb, {
+          companyId: routine.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          action: "routine.trigger_secret_rotated",
+          entityType: "routine_trigger",
+          entityId: trigger.id,
+          details: { routineId: routine.id },
+        });
+        return next;
       });
       res.json(rotated);
     },
@@ -283,18 +332,24 @@ export function routineRoutes(
       return;
     }
     await assertBoardCanAssignTasks(req, routine.companyId);
-    const run = await svc.runRoutine(routine.id, req.body);
     const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: routine.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "routine.run_triggered",
-      entityType: "routine_run",
-      entityId: run.id,
-      details: { routineId: routine.id, source: run.source, status: run.status },
+    const run = await withCompanyRls(db, routine.companyId, async (scopedDb) => {
+      const scopedSvc = routineService(scopedDb, {
+        pluginWorkerManager: options.pluginWorkerManager,
+      });
+      const next = await scopedSvc.runRoutine(routine.id, req.body);
+      await logActivity(scopedDb, {
+        companyId: routine.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "routine.run_triggered",
+        entityType: "routine_run",
+        entityId: next.id,
+        details: { routineId: routine.id, source: next.source, status: next.status },
+      });
+      return next;
     });
     res.status(202).json(run);
   });

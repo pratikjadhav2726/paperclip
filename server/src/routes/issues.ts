@@ -58,6 +58,7 @@ import {
 import { logger } from "../middleware/logger.js";
 import { conflict, forbidden, HttpError, notFound, unauthorized } from "../errors.js";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
+import { withCompanyRls } from "../services/company-rls.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectIssueWorkspaceCommandPaths,
@@ -825,13 +826,19 @@ export function issueRoutes(
     return rawId;
   }
 
-  async function resolveIssueProjectAndGoal(issue: {
+  async function resolveIssueProjectAndGoal(
+    issue: {
     companyId: string;
     projectId: string | null;
     goalId: string | null;
-  }) {
-    const projectPromise = issue.projectId ? projectsSvc.getById(issue.projectId) : Promise.resolve(null);
-    const directGoalPromise = issue.goalId ? goalsSvc.getById(issue.goalId) : Promise.resolve(null);
+    },
+    scoped: {
+      projects: Pick<typeof projectsSvc, "getById">;
+      goals: Pick<typeof goalsSvc, "getById" | "getDefaultCompanyGoal">;
+    } = { projects: projectsSvc, goals: goalsSvc },
+  ) {
+    const projectPromise = issue.projectId ? scoped.projects.getById(issue.projectId) : Promise.resolve(null);
+    const directGoalPromise = issue.goalId ? scoped.goals.getById(issue.goalId) : Promise.resolve(null);
     const [project, directGoal] = await Promise.all([projectPromise, directGoalPromise]);
 
     if (directGoal) {
@@ -840,12 +847,12 @@ export function issueRoutes(
 
     const projectGoalId = project?.goalId ?? project?.goalIds[0] ?? null;
     if (projectGoalId) {
-      const projectGoal = await goalsSvc.getById(projectGoalId);
+      const projectGoal = await scoped.goals.getById(projectGoalId);
       return { project, goal: projectGoal };
     }
 
     if (!issue.projectId) {
-      const defaultGoal = await goalsSvc.getDefaultCompanyGoal(issue.companyId);
+      const defaultGoal = await scoped.goals.getDefaultCompanyGoal(issue.companyId);
       return { project, goal: defaultGoal };
     }
 
@@ -929,55 +936,62 @@ export function issueRoutes(
       return;
     }
 
-    const result = await svc.list(companyId, {
-      status: req.query.status as string | undefined,
-      assigneeAgentId: req.query.assigneeAgentId as string | undefined,
-      participantAgentId: req.query.participantAgentId as string | undefined,
-      assigneeUserId,
-      touchedByUserId,
-      inboxArchivedByUserId,
-      unreadForUserId,
-      projectId: req.query.projectId as string | undefined,
-      workspaceId: req.query.workspaceId as string | undefined,
-      executionWorkspaceId: req.query.executionWorkspaceId as string | undefined,
-      parentId: req.query.parentId as string | undefined,
-      descendantOf: req.query.descendantOf as string | undefined,
-      labelId: req.query.labelId as string | undefined,
-      originKind: req.query.originKind as string | undefined,
-      originId: req.query.originId as string | undefined,
-      includeRoutineExecutions:
-        req.query.includeRoutineExecutions === "true" || req.query.includeRoutineExecutions === "1",
-      excludeRoutineExecutions:
-        req.query.excludeRoutineExecutions === "true" || req.query.excludeRoutineExecutions === "1",
-      includeBlockedBy: req.query.includeBlockedBy === "true" || req.query.includeBlockedBy === "1",
-      q: req.query.q as string | undefined,
-      limit,
-    });
+    const result = await withCompanyRls(db, companyId, (scopedDb) =>
+      issueService(scopedDb).list(companyId, {
+        status: req.query.status as string | undefined,
+        assigneeAgentId: req.query.assigneeAgentId as string | undefined,
+        participantAgentId: req.query.participantAgentId as string | undefined,
+        assigneeUserId,
+        touchedByUserId,
+        inboxArchivedByUserId,
+        unreadForUserId,
+        projectId: req.query.projectId as string | undefined,
+        workspaceId: req.query.workspaceId as string | undefined,
+        executionWorkspaceId: req.query.executionWorkspaceId as string | undefined,
+        parentId: req.query.parentId as string | undefined,
+        descendantOf: req.query.descendantOf as string | undefined,
+        labelId: req.query.labelId as string | undefined,
+        originKind: req.query.originKind as string | undefined,
+        originId: req.query.originId as string | undefined,
+        includeRoutineExecutions:
+          req.query.includeRoutineExecutions === "true" || req.query.includeRoutineExecutions === "1",
+        excludeRoutineExecutions:
+          req.query.excludeRoutineExecutions === "true" || req.query.excludeRoutineExecutions === "1",
+        includeBlockedBy: req.query.includeBlockedBy === "true" || req.query.includeBlockedBy === "1",
+        q: req.query.q as string | undefined,
+        limit,
+      }),
+    );
     res.json(result);
   });
 
   router.get("/companies/:companyId/labels", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    const result = await svc.listLabels(companyId);
+    const result = await withCompanyRls(db, companyId, (scopedDb) =>
+      issueService(scopedDb).listLabels(companyId),
+    );
     res.json(result);
   });
 
   router.post("/companies/:companyId/labels", validate(createIssueLabelSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    const label = await svc.createLabel(companyId, req.body);
     const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "label.created",
-      entityType: "label",
-      entityId: label.id,
-      details: { name: label.name, color: label.color },
+    const label = await withCompanyRls(db, companyId, async (scopedDb) => {
+      const created = await issueService(scopedDb).createLabel(companyId, req.body);
+      await logActivity(scopedDb, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "label.created",
+        entityType: "label",
+        entityId: created.id,
+        details: { name: created.name, color: created.color },
+      });
+      return created;
     });
     res.status(201).json(label);
   });
@@ -990,23 +1004,27 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, existing.companyId);
-    const removed = await svc.deleteLabel(labelId);
+    const actor = getActorInfo(req);
+    const removed = await withCompanyRls(db, existing.companyId, async (scopedDb) => {
+      const deleted = await issueService(scopedDb).deleteLabel(labelId);
+      if (!deleted) return null;
+      await logActivity(scopedDb, {
+        companyId: deleted.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "label.deleted",
+        entityType: "label",
+        entityId: deleted.id,
+        details: { name: deleted.name, color: deleted.color },
+      });
+      return deleted;
+    });
     if (!removed) {
       res.status(404).json({ error: "Label not found" });
       return;
     }
-    const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: removed.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "label.deleted",
-      entityType: "label",
-      entityId: removed.id,
-      details: { name: removed.name, color: removed.color },
-    });
     res.json(removed);
   });
 
@@ -1023,32 +1041,55 @@ export function issueRoutes(
       typeof req.query.wakeCommentId === "string" && req.query.wakeCommentId.trim().length > 0
         ? req.query.wakeCommentId.trim()
         : null;
+    const payload = await withCompanyRls(db, issue.companyId, async (scopedDb) => {
+      const scopedIssueService = issueService(scopedDb);
+      const scopedProjectsService = projectService(scopedDb);
+      const scopedGoalsService = goalService(scopedDb);
+      const scopedDocumentsService = documentService(scopedDb);
+      const scopedExecutionWorkspacesService = executionWorkspaceServiceDirect(scopedDb);
 
-    const currentExecutionWorkspacePromise = issue.executionWorkspaceId
-      ? executionWorkspacesSvc.getById(issue.executionWorkspaceId)
-      : Promise.resolve(null);
-    const [
-      { project, goal },
-      ancestors,
-      commentCursor,
-      wakeComment,
-      relations,
-      blockerAttention,
-      attachments,
-      continuationSummary,
-      currentExecutionWorkspace,
-    ] =
-      await Promise.all([
-        resolveIssueProjectAndGoal(issue),
-        svc.getAncestors(issue.id),
-        svc.getCommentCursor(issue.id),
-        wakeCommentId ? svc.getComment(wakeCommentId) : null,
-        svc.getRelationSummaries(issue.id),
-        svc.listBlockerAttention(issue.companyId, [issue]).then((map) => map.get(issue.id) ?? null),
-        svc.listAttachments(issue.id),
-        documentsSvc.getIssueDocumentByKey(issue.id, ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY),
-        currentExecutionWorkspacePromise,
-      ]);
+      const currentExecutionWorkspacePromise = issue.executionWorkspaceId
+        ? scopedExecutionWorkspacesService.getById(issue.executionWorkspaceId)
+        : Promise.resolve(null);
+      const [
+        { project, goal },
+        ancestors,
+        commentCursor,
+        wakeComment,
+        relations,
+        blockerAttention,
+        attachments,
+        continuationSummary,
+        currentExecutionWorkspace,
+      ] =
+        await Promise.all([
+          resolveIssueProjectAndGoal(issue, {
+            projects: scopedProjectsService,
+            goals: scopedGoalsService,
+          }),
+          scopedIssueService.getAncestors(issue.id),
+          scopedIssueService.getCommentCursor(issue.id),
+          wakeCommentId ? scopedIssueService.getComment(wakeCommentId) : null,
+          scopedIssueService.getRelationSummaries(issue.id),
+          scopedIssueService.listBlockerAttention(issue.companyId, [issue]).then((map) => map.get(issue.id) ?? null),
+          scopedIssueService.listAttachments(issue.id),
+          scopedDocumentsService.getIssueDocumentByKey(issue.id, ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY),
+          currentExecutionWorkspacePromise,
+        ]);
+
+      return {
+        project,
+        goal,
+        ancestors,
+        commentCursor,
+        wakeComment,
+        relations,
+        blockerAttention,
+        attachments,
+        continuationSummary,
+        currentExecutionWorkspace,
+      };
+    });
 
     res.json({
       issue: {
@@ -1057,47 +1098,47 @@ export function issueRoutes(
         title: issue.title,
         description: issue.description,
         status: issue.status,
-        ...(blockerAttention ? { blockerAttention } : {}),
+        ...(payload.blockerAttention ? { blockerAttention: payload.blockerAttention } : {}),
         priority: issue.priority,
         projectId: issue.projectId,
-        goalId: goal?.id ?? issue.goalId,
+        goalId: payload.goal?.id ?? issue.goalId,
         parentId: issue.parentId,
-        blockedBy: relations.blockedBy,
-        blocks: relations.blocks,
+        blockedBy: payload.relations.blockedBy,
+        blocks: payload.relations.blocks,
         assigneeAgentId: issue.assigneeAgentId,
         assigneeUserId: issue.assigneeUserId,
         updatedAt: issue.updatedAt,
       },
-      ancestors: ancestors.map((ancestor) => ({
+      ancestors: payload.ancestors.map((ancestor) => ({
         id: ancestor.id,
         identifier: ancestor.identifier,
         title: ancestor.title,
         status: ancestor.status,
         priority: ancestor.priority,
       })),
-      project: project
+      project: payload.project
         ? {
-            id: project.id,
-            name: project.name,
-            status: project.status,
-            targetDate: project.targetDate,
+            id: payload.project.id,
+            name: payload.project.name,
+            status: payload.project.status,
+            targetDate: payload.project.targetDate,
           }
         : null,
-      goal: goal
+      goal: payload.goal
         ? {
-            id: goal.id,
-            title: goal.title,
-            status: goal.status,
-            level: goal.level,
-            parentId: goal.parentId,
+            id: payload.goal.id,
+            title: payload.goal.title,
+            status: payload.goal.status,
+            level: payload.goal.level,
+            parentId: payload.goal.parentId,
           }
         : null,
-      commentCursor,
+      commentCursor: payload.commentCursor,
       wakeComment:
-        wakeComment && wakeComment.issueId === issue.id
-          ? wakeComment
+        payload.wakeComment && payload.wakeComment.issueId === issue.id
+          ? payload.wakeComment
           : null,
-      attachments: attachments.map((a) => ({
+      attachments: payload.attachments.map((a) => ({
         id: a.id,
         filename: a.originalFilename,
         contentType: a.contentType,
@@ -1105,17 +1146,17 @@ export function issueRoutes(
         contentPath: withContentPath(a).contentPath,
         createdAt: a.createdAt,
       })),
-      continuationSummary: continuationSummary
+      continuationSummary: payload.continuationSummary
         ? {
-            key: continuationSummary.key,
-            title: continuationSummary.title,
-            body: continuationSummary.body,
-            latestRevisionId: continuationSummary.latestRevisionId,
-            latestRevisionNumber: continuationSummary.latestRevisionNumber,
-            updatedAt: continuationSummary.updatedAt,
+            key: payload.continuationSummary.key,
+            title: payload.continuationSummary.title,
+            body: payload.continuationSummary.body,
+            latestRevisionId: payload.continuationSummary.latestRevisionId,
+            latestRevisionNumber: payload.continuationSummary.latestRevisionNumber,
+            updatedAt: payload.continuationSummary.updatedAt,
           }
         : null,
-      currentExecutionWorkspace,
+      currentExecutionWorkspace: payload.currentExecutionWorkspace,
     });
   });
 
@@ -1127,37 +1168,64 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, issue.companyId);
-    const [{ project, goal }, ancestors, mentionedProjectIds, documentPayload, relations, blockerAttention, referenceSummary] = await Promise.all([
-      resolveIssueProjectAndGoal(issue),
-      svc.getAncestors(issue.id),
-      svc.findMentionedProjectIds(issue.id, { includeCommentBodies: false }),
-      documentsSvc.getIssueDocumentPayload(issue),
-      svc.getRelationSummaries(issue.id),
-      svc.listBlockerAttention(issue.companyId, [issue]).then((map) => map.get(issue.id) ?? null),
-      issueReferencesSvc.listIssueReferenceSummary(issue.id),
-    ]);
-    const mentionedProjects = mentionedProjectIds.length > 0
-      ? await projectsSvc.listByIds(issue.companyId, mentionedProjectIds)
-      : [];
-    const currentExecutionWorkspace = issue.executionWorkspaceId
-      ? await executionWorkspacesSvc.getById(issue.executionWorkspaceId)
-      : null;
-    const workProducts = await workProductsSvc.listForIssue(issue.id);
+    const payload = await withCompanyRls(db, issue.companyId, async (scopedDb) => {
+      const scopedIssueService = issueService(scopedDb);
+      const scopedProjectsService = projectService(scopedDb);
+      const scopedGoalsService = goalService(scopedDb);
+      const scopedDocumentsService = documentService(scopedDb);
+      const scopedIssueReferencesService = issueReferenceService(scopedDb);
+      const scopedExecutionWorkspacesService = executionWorkspaceServiceDirect(scopedDb);
+      const scopedWorkProductsService = workProductService(scopedDb);
+
+      const [{ project, goal }, ancestors, mentionedProjectIds, documentPayload, relations, blockerAttention, referenceSummary] = await Promise.all([
+        resolveIssueProjectAndGoal(issue, {
+          projects: scopedProjectsService,
+          goals: scopedGoalsService,
+        }),
+        scopedIssueService.getAncestors(issue.id),
+        scopedIssueService.findMentionedProjectIds(issue.id, { includeCommentBodies: false }),
+        scopedDocumentsService.getIssueDocumentPayload(issue),
+        scopedIssueService.getRelationSummaries(issue.id),
+        scopedIssueService.listBlockerAttention(issue.companyId, [issue]).then((map) => map.get(issue.id) ?? null),
+        scopedIssueReferencesService.listIssueReferenceSummary(issue.id),
+      ]);
+
+      const mentionedProjects = mentionedProjectIds.length > 0
+        ? await scopedProjectsService.listByIds(issue.companyId, mentionedProjectIds)
+        : [];
+      const currentExecutionWorkspace = issue.executionWorkspaceId
+        ? await scopedExecutionWorkspacesService.getById(issue.executionWorkspaceId)
+        : null;
+      const workProducts = await scopedWorkProductsService.listForIssue(issue.id);
+
+      return {
+        project,
+        goal,
+        ancestors,
+        documentPayload,
+        relations,
+        blockerAttention,
+        referenceSummary,
+        mentionedProjects,
+        currentExecutionWorkspace,
+        workProducts,
+      };
+    });
     res.json({
       ...issue,
-      goalId: goal?.id ?? issue.goalId,
-      ancestors,
-      ...(blockerAttention ? { blockerAttention } : {}),
-      blockedBy: relations.blockedBy,
-      blocks: relations.blocks,
-      relatedWork: referenceSummary,
-      referencedIssueIdentifiers: referenceSummary.outbound.map((item) => item.issue.identifier ?? item.issue.id),
-      ...documentPayload,
-      project: project ?? null,
-      goal: goal ?? null,
-      mentionedProjects,
-      currentExecutionWorkspace,
-      workProducts,
+      goalId: payload.goal?.id ?? issue.goalId,
+      ancestors: payload.ancestors,
+      ...(payload.blockerAttention ? { blockerAttention: payload.blockerAttention } : {}),
+      blockedBy: payload.relations.blockedBy,
+      blocks: payload.relations.blocks,
+      relatedWork: payload.referenceSummary,
+      referencedIssueIdentifiers: payload.referenceSummary.outbound.map((item) => item.issue.identifier ?? item.issue.id),
+      ...payload.documentPayload,
+      project: payload.project ?? null,
+      goal: payload.goal ?? null,
+      mentionedProjects: payload.mentionedProjects,
+      currentExecutionWorkspace: payload.currentExecutionWorkspace,
+      workProducts: payload.workProducts,
     });
   });
 
@@ -1169,7 +1237,9 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, issue.companyId);
-    const workProducts = await workProductsSvc.listForIssue(issue.id);
+    const workProducts = await withCompanyRls(db, issue.companyId, (scopedDb) =>
+      workProductService(scopedDb).listForIssue(issue.id),
+    );
     res.json(workProducts);
   });
 
@@ -1181,9 +1251,11 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, issue.companyId);
-    const docs = await documentsSvc.listIssueDocuments(issue.id, {
-      includeSystem: req.query.includeSystem === "true",
-    });
+    const docs = await withCompanyRls(db, issue.companyId, (scopedDb) =>
+      documentService(scopedDb).listIssueDocuments(issue.id, {
+        includeSystem: req.query.includeSystem === "true",
+      }),
+    );
     res.json(docs);
   });
 
@@ -1200,7 +1272,9 @@ export function issueRoutes(
       res.status(400).json({ error: "Invalid document key", details: keyParsed.error.issues });
       return;
     }
-    const doc = await documentsSvc.getIssueDocumentByKey(issue.id, keyParsed.data);
+    const doc = await withCompanyRls(db, issue.companyId, (scopedDb) =>
+      documentService(scopedDb).getIssueDocumentByKey(issue.id, keyParsed.data),
+    );
     if (!doc) {
       res.status(404).json({ error: "Document not found" });
       return;
@@ -1303,7 +1377,9 @@ export function issueRoutes(
       res.status(400).json({ error: "Invalid document key", details: keyParsed.error.issues });
       return;
     }
-    const revisions = await documentsSvc.listIssueDocumentRevisions(issue.id, keyParsed.data);
+    const revisions = await withCompanyRls(db, issue.companyId, (scopedDb) =>
+      documentService(scopedDb).listIssueDocumentRevisions(issue.id, keyParsed.data),
+    );
     res.json(revisions);
   });
 
@@ -1573,18 +1649,21 @@ export function issueRoutes(
       res.status(403).json({ error: "Board user context required" });
       return;
     }
-    const readState = await svc.markRead(issue.companyId, issue.id, req.actor.userId, new Date());
     const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: issue.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "issue.read_marked",
-      entityType: "issue",
-      entityId: issue.id,
-      details: { userId: req.actor.userId, lastReadAt: readState.lastReadAt },
+    const readState = await withCompanyRls(db, issue.companyId, async (scopedDb) => {
+      const state = await issueService(scopedDb).markRead(issue.companyId, issue.id, req.actor.userId!, new Date());
+      await logActivity(scopedDb, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.read_marked",
+        entityType: "issue",
+        entityId: issue.id,
+        details: { userId: req.actor.userId, lastReadAt: state.lastReadAt },
+      });
+      return state;
     });
     res.json(readState);
   });
@@ -1605,18 +1684,21 @@ export function issueRoutes(
       res.status(403).json({ error: "Board user context required" });
       return;
     }
-    const removed = await svc.markUnread(issue.companyId, issue.id, req.actor.userId);
     const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: issue.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "issue.read_unmarked",
-      entityType: "issue",
-      entityId: issue.id,
-      details: { userId: req.actor.userId },
+    const removed = await withCompanyRls(db, issue.companyId, async (scopedDb) => {
+      const result = await issueService(scopedDb).markUnread(issue.companyId, issue.id, req.actor.userId!);
+      await logActivity(scopedDb, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.read_unmarked",
+        entityType: "issue",
+        entityId: issue.id,
+        details: { userId: req.actor.userId },
+      });
+      return result;
     });
     res.json({ id: issue.id, removed });
   });
@@ -1637,18 +1719,21 @@ export function issueRoutes(
       res.status(403).json({ error: "Board user context required" });
       return;
     }
-    const archiveState = await svc.archiveInbox(issue.companyId, issue.id, req.actor.userId, new Date());
     const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: issue.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "issue.inbox_archived",
-      entityType: "issue",
-      entityId: issue.id,
-      details: { userId: req.actor.userId, archivedAt: archiveState.archivedAt },
+    const archiveState = await withCompanyRls(db, issue.companyId, async (scopedDb) => {
+      const state = await issueService(scopedDb).archiveInbox(issue.companyId, issue.id, req.actor.userId!, new Date());
+      await logActivity(scopedDb, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.inbox_archived",
+        entityType: "issue",
+        entityId: issue.id,
+        details: { userId: req.actor.userId, archivedAt: state.archivedAt },
+      });
+      return state;
     });
     res.json(archiveState);
   });
@@ -1669,18 +1754,21 @@ export function issueRoutes(
       res.status(403).json({ error: "Board user context required" });
       return;
     }
-    const removed = await svc.unarchiveInbox(issue.companyId, issue.id, req.actor.userId);
     const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: issue.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "issue.inbox_unarchived",
-      entityType: "issue",
-      entityId: issue.id,
-      details: { userId: req.actor.userId },
+    const removed = await withCompanyRls(db, issue.companyId, async (scopedDb) => {
+      const result = await issueService(scopedDb).unarchiveInbox(issue.companyId, issue.id, req.actor.userId!);
+      await logActivity(scopedDb, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.inbox_unarchived",
+        entityType: "issue",
+        entityId: issue.id,
+        details: { userId: req.actor.userId },
+      });
+      return result;
     });
     res.json(removed ?? { ok: true });
   });
@@ -1693,7 +1781,9 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, issue.companyId);
-    const approvals = await issueApprovalsSvc.listApprovalsForIssue(id);
+    const approvals = await withCompanyRls(db, issue.companyId, (scopedDb) =>
+      issueApprovalService(scopedDb).listApprovalsForIssue(id),
+    );
     res.json(approvals);
   });
 
@@ -1709,24 +1799,27 @@ export function issueRoutes(
     if (!(await assertCanManageIssueApprovalLinks(req, res, issue.companyId))) return;
 
     const actor = getActorInfo(req);
-    await issueApprovalsSvc.link(id, req.body.approvalId, {
-      agentId: actor.agentId,
-      userId: actor.actorType === "user" ? actor.actorId : null,
-    });
+    const approvals = await withCompanyRls(db, issue.companyId, async (scopedDb) => {
+      const scopedIssueApprovalsService = issueApprovalService(scopedDb);
+      await scopedIssueApprovalsService.link(id, req.body.approvalId, {
+        agentId: actor.agentId,
+        userId: actor.actorType === "user" ? actor.actorId : null,
+      });
 
-    await logActivity(db, {
-      companyId: issue.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "issue.approval_linked",
-      entityType: "issue",
-      entityId: issue.id,
-      details: { approvalId: req.body.approvalId },
-    });
+      await logActivity(scopedDb, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.approval_linked",
+        entityType: "issue",
+        entityId: issue.id,
+        details: { approvalId: req.body.approvalId },
+      });
 
-    const approvals = await issueApprovalsSvc.listApprovalsForIssue(id);
+      return scopedIssueApprovalsService.listApprovalsForIssue(id);
+    });
     res.status(201).json(approvals);
   });
 
@@ -1742,19 +1835,20 @@ export function issueRoutes(
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     if (!(await assertCanManageIssueApprovalLinks(req, res, issue.companyId))) return;
 
-    await issueApprovalsSvc.unlink(id, approvalId);
-
     const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: issue.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "issue.approval_unlinked",
-      entityType: "issue",
-      entityId: issue.id,
-      details: { approvalId },
+    await withCompanyRls(db, issue.companyId, async (scopedDb) => {
+      await issueApprovalService(scopedDb).unlink(id, approvalId);
+      await logActivity(scopedDb, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.approval_unlinked",
+        entityType: "issue",
+        entityId: issue.id,
+        details: { approvalId },
+      });
     });
 
     res.json({ ok: true });
@@ -2870,11 +2964,13 @@ export function issueRoutes(
       limitRaw && Number.isFinite(limitRaw) && limitRaw > 0
         ? Math.min(Math.floor(limitRaw), MAX_ISSUE_COMMENT_LIMIT)
         : null;
-    const comments = await svc.listComments(id, {
-      afterCommentId,
-      order,
-      limit,
-    });
+    const comments = await withCompanyRls(db, issue.companyId, (scopedDb) =>
+      issueService(scopedDb).listComments(id, {
+        afterCommentId,
+        order,
+        limit,
+      }),
+    );
     res.json(comments);
   });
 
@@ -2886,7 +2982,9 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, issue.companyId);
-    const interactions = await issueThreadInteractionService(db).listForIssue(id);
+    const interactions = await withCompanyRls(db, issue.companyId, (scopedDb) =>
+      issueThreadInteractionService(scopedDb).listForIssue(id),
+    );
     res.json(interactions);
   });
 
