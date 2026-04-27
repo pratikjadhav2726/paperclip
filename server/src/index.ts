@@ -28,6 +28,7 @@ import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
+import { createSchedulerLeaseRunner, type SchedulerLeaseResult } from "./services/scheduler-lease.js";
 import {
   feedbackService,
   heartbeatService,
@@ -671,13 +672,20 @@ export async function startServer(): Promise<StartedServer> {
   if (config.heartbeatSchedulerEnabled) {
     const heartbeat = heartbeatService(db as any, { pluginWorkerManager });
     const routines = routineService(db as any, { pluginWorkerManager });
+    const schedulerLeases = createSchedulerLeaseRunner(db as any);
+
+    function logSchedulerLeaseSkip(task: string, result: SchedulerLeaseResult<unknown>) {
+      if (!result.acquired) {
+        logger.debug({ task, reason: result.reason }, "scheduler task skipped because another runner owns the lease");
+      }
+    }
   
-    // Reap orphaned running runs at startup while in-memory execution state is empty,
-    // then resume any persisted queued runs that were waiting on the previous process.
-    void heartbeat
-      .reapOrphanedRuns()
-      .then(() => heartbeat.promoteDueScheduledRetries())
-      .then(async (promotion) => {
+    const runHeartbeatRecovery = async (phase: "startup" | "periodic") => {
+      // Reap orphaned running runs while in-memory execution state is empty or stale,
+      // then resume any persisted queued runs that were waiting on another process.
+      const promotion = await heartbeat
+        .reapOrphanedRuns(phase === "periodic" ? { staleThresholdMs: 5 * 60 * 1000 } : undefined)
+        .then(() => heartbeat.promoteDueScheduledRetries());
         await heartbeat.resumeQueuedRuns();
         const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
         if (
@@ -688,80 +696,53 @@ export async function startServer(): Promise<StartedServer> {
         ) {
           logger.warn(
             { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds, ...reconciled },
-            "startup heartbeat recovery changed assigned issue state",
+            `${phase} heartbeat recovery changed assigned issue state`,
           );
         }
-      })
-      .then(async () => {
-        const reconciled = await heartbeat.reconcileIssueGraphLiveness();
-        if (reconciled.escalationsCreated > 0) {
-          logger.warn({ ...reconciled }, "startup issue-graph liveness reconciliation created escalations");
-        }
-      })
-      .then(async () => {
-        const scanned = await heartbeat.scanSilentActiveRuns();
-        if (scanned.created > 0 || scanned.escalated > 0) {
-          logger.warn({ ...scanned }, "startup active-run output watchdog created review work");
-        }
-      })
+      const issueGraphReconciled = await heartbeat.reconcileIssueGraphLiveness();
+      if (issueGraphReconciled.escalationsCreated > 0) {
+        logger.warn({ ...issueGraphReconciled }, `${phase} issue-graph liveness reconciliation created escalations`);
+      }
+      const scanned = await heartbeat.scanSilentActiveRuns();
+      if (scanned.created > 0 || scanned.escalated > 0) {
+        logger.warn({ ...scanned }, `${phase} active-run output watchdog created review work`);
+      }
+    };
+  
+    void schedulerLeases
+      .run("paperclip:heartbeat:startup-recovery", () => runHeartbeatRecovery("startup"))
+      .then((result) => logSchedulerLeaseSkip("heartbeat-startup-recovery", result))
       .catch((err) => {
         logger.error({ err }, "startup heartbeat recovery failed");
       });
     setInterval(() => {
-      void heartbeat
-        .tickTimers(new Date())
-        .then((result) => {
+      void schedulerLeases
+        .run("paperclip:heartbeat:timers", async () => {
+          const result = await heartbeat.tickTimers(new Date());
           if (result.enqueued > 0) {
             logger.info({ ...result }, "heartbeat timer tick enqueued runs");
           }
         })
+        .then((result) => logSchedulerLeaseSkip("heartbeat-timers", result))
         .catch((err) => {
           logger.error({ err }, "heartbeat timer tick failed");
         });
 
-      void routines
-        .tickScheduledTriggers(new Date())
-        .then((result) => {
+      void schedulerLeases
+        .run("paperclip:routines:scheduled-triggers", async () => {
+          const result = await routines.tickScheduledTriggers(new Date());
           if (result.triggered > 0) {
             logger.info({ ...result }, "routine scheduler tick enqueued runs");
           }
         })
+        .then((result) => logSchedulerLeaseSkip("routine-scheduled-triggers", result))
         .catch((err) => {
           logger.error({ err }, "routine scheduler tick failed");
         });
   
-      // Periodically reap orphaned runs (5-min staleness threshold) and make sure
-      // persisted queued work is still being driven forward.
-      void heartbeat
-        .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
-        .then(() => heartbeat.promoteDueScheduledRetries())
-        .then(async (promotion) => {
-          await heartbeat.resumeQueuedRuns();
-          const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
-          if (
-            promotion.promoted > 0 ||
-            reconciled.dispatchRequeued > 0 ||
-            reconciled.continuationRequeued > 0 ||
-            reconciled.escalated > 0
-          ) {
-            logger.warn(
-              { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds, ...reconciled },
-              "periodic heartbeat recovery changed assigned issue state",
-            );
-          }
-        })
-        .then(async () => {
-          const reconciled = await heartbeat.reconcileIssueGraphLiveness();
-          if (reconciled.escalationsCreated > 0) {
-            logger.warn({ ...reconciled }, "periodic issue-graph liveness reconciliation created escalations");
-          }
-        })
-        .then(async () => {
-          const scanned = await heartbeat.scanSilentActiveRuns();
-          if (scanned.created > 0 || scanned.escalated > 0) {
-            logger.warn({ ...scanned }, "periodic active-run output watchdog created review work");
-          }
-        })
+      void schedulerLeases
+        .run("paperclip:heartbeat:periodic-recovery", () => runHeartbeatRecovery("periodic"))
+        .then((result) => logSchedulerLeaseSkip("heartbeat-periodic-recovery", result))
         .catch((err) => {
           logger.error({ err }, "periodic heartbeat recovery failed");
         });
