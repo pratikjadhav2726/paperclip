@@ -167,6 +167,20 @@ describe("server adapter registry", () => {
     expect(adapter!.supportsLocalAgentJwt).toBe(true);
   });
 
+  it("registers the GrowthOS native adapter as a built-in delegate", async () => {
+    const adapter = requireServerAdapter("growthos_native");
+
+    expect(adapter.type).toBe("growthos_native");
+    expect(adapter.supportsLocalAgentJwt).toBe(true);
+    expect(adapter.supportsInstructionsBundle).toBe(true);
+
+    const environment = await adapter.testEnvironment({
+      adapterType: "growthos_native",
+      config: {},
+    });
+    expect(environment.status).toBe("warn");
+  });
+
   it("switches active adapter behavior back to the builtin when an override is paused", async () => {
     const builtIn = findServerAdapter("claude_local");
     expect(builtIn).not.toBeNull();

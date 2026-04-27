@@ -96,6 +96,11 @@ const adapterDisplayMap: Record<string, AdapterDisplayInfo> = {
     comingSoon: true,
     disabledLabel: "Configure OpenClaw within the App",
   },
+  growthos_native: {
+    label: "GrowthOS Native",
+    description: "Delegate execution to the GrowthOS harness",
+    icon: Cpu,
+  },
   process: {
     label: "Process",
     description: "Internal process adapter",

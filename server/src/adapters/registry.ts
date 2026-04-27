@@ -85,6 +85,7 @@ import { buildExternalAdapters } from "./plugin-loader.js";
 import { getDisabledAdapterTypes } from "../services/adapter-plugin-store.js";
 import { processAdapter } from "./process/index.js";
 import { httpAdapter } from "./http/index.js";
+import { growthosNativeAdapter } from "./growthos-native/index.js";
 
 function normalizeHermesConfig<T extends { config?: unknown; agent?: unknown }>(ctx: T): T {
   const config =
@@ -319,6 +320,7 @@ function registerBuiltInAdapters() {
     geminiLocalAdapter,
     openclawGatewayAdapter,
     hermesLocalAdapter,
+    growthosNativeAdapter,
     processAdapter,
     httpAdapter,
   ]) {

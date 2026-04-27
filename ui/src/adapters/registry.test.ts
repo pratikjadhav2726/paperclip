@@ -35,6 +35,13 @@ describe("ui adapter registry", () => {
     expect(listUIAdapters().some((adapter) => adapter.type === "external_test")).toBe(true);
   });
 
+  it("registers GrowthOS native as a first-class UI adapter", () => {
+    const adapter = getUIAdapter("growthos_native");
+
+    expect(adapter.type).toBe("growthos_native");
+    expect(adapter.label).toBe("GrowthOS Native");
+  });
+
   it("falls back to the process parser for unknown types after unregistering", () => {
     registerUIAdapter(externalUIAdapter);
 
