@@ -9,8 +9,16 @@ const mockSidebarPreferenceService = vi.hoisted(() => ({
   upsertProjectOrder: vi.fn(),
 }));
 const mockLogActivity = vi.hoisted(() => vi.fn());
+const mockWithCompanyRls = vi.hoisted(() =>
+  vi.fn(async (_db: unknown, _companyId: string, operation: (scopedDb: unknown) => Promise<unknown>) =>
+    operation({ scoped: true }),
+  ),
+);
 
 function registerModuleMocks() {
+  vi.doMock("../services/company-rls.js", () => ({
+    withCompanyRls: mockWithCompanyRls,
+  }));
   vi.doMock("../services/index.js", () => ({
     sidebarPreferenceService: () => mockSidebarPreferenceService,
     logActivity: mockLogActivity,
@@ -42,11 +50,13 @@ describe("sidebar preference routes", () => {
   beforeEach(() => {
     vi.resetModules();
     vi.doUnmock("../services/index.js");
+    vi.doUnmock("../services/company-rls.js");
     vi.doUnmock("../routes/sidebar-preferences.js");
     vi.doUnmock("../routes/authz.js");
     vi.doUnmock("../middleware/index.js");
     registerModuleMocks();
     vi.clearAllMocks();
+    mockWithCompanyRls.mockClear();
     mockSidebarPreferenceService.getCompanyOrder.mockResolvedValue({
       orderedIds: ORDERED_IDS,
       updatedAt: null,
@@ -77,6 +87,7 @@ describe("sidebar preference routes", () => {
     const res = await request(app).get("/api/sidebar-preferences/me");
 
     expect(res.status).toBe(200);
+    expect(mockWithCompanyRls).not.toHaveBeenCalled();
     expect(res.body).toEqual({
       orderedIds: ORDERED_IDS,
       updatedAt: null,
@@ -98,6 +109,7 @@ describe("sidebar preference routes", () => {
       .send({ orderedIds: ORDERED_IDS });
 
     expect(res.status).toBe(200);
+    expect(mockWithCompanyRls).not.toHaveBeenCalled();
     expect(mockSidebarPreferenceService.upsertCompanyOrder).toHaveBeenCalledWith("user-1", ORDERED_IDS);
   });
 
@@ -113,6 +125,7 @@ describe("sidebar preference routes", () => {
     const res = await request(app).get("/api/companies/company-1/sidebar-preferences/me");
 
     expect(res.status).toBe(200);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), "company-1", expect.any(Function));
     expect(mockSidebarPreferenceService.getProjectOrder).toHaveBeenCalledWith("company-1", "user-1");
   });
 
@@ -131,9 +144,10 @@ describe("sidebar preference routes", () => {
       .send({ orderedIds: ORDERED_IDS });
 
     expect(res.status).toBe(200);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), "company-1", expect.any(Function));
     expect(mockSidebarPreferenceService.upsertProjectOrder).toHaveBeenCalledWith("company-1", "user-1", ORDERED_IDS);
     expect(mockLogActivity).toHaveBeenCalledWith(
-      {} as never,
+      expect.anything(),
       expect.objectContaining({
         companyId: "company-1",
         action: "sidebar_preferences.project_order_updated",
@@ -157,6 +171,7 @@ describe("sidebar preference routes", () => {
     const res = await request(app).get("/api/companies/company-1/sidebar-preferences/me");
 
     expect(res.status).toBe(403);
+    expect(mockWithCompanyRls).not.toHaveBeenCalled();
     expect(mockSidebarPreferenceService.getProjectOrder).not.toHaveBeenCalled();
   });
 

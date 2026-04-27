@@ -17,6 +17,7 @@ import type {
   UserProfileWindowStats,
 } from "@paperclipai/shared";
 import { notFound } from "../errors.js";
+import { withCompanyRls } from "../services/company-rls.js";
 import { assertCompanyAccess } from "./authz.js";
 
 type CompanyUserRow = {
@@ -305,129 +306,131 @@ export function userProfileRoutes(db: Db) {
     const userSlug = req.params.userSlug as string;
     assertCompanyAccess(req, companyId);
 
-    const row = await resolveCompanyUser(db, companyId, userSlug);
-    if (!row) throw notFound("User not found");
-    const canonicalSlug = userSlugCandidates(row)[0] ?? row.principalId;
-    const userId = row.userId ?? row.principalId;
+    const payload = await withCompanyRls(db, companyId, async (scopedDb) => {
+      const row = await resolveCompanyUser(scopedDb, companyId, userSlug);
+      if (!row) throw notFound("User not found");
+      const canonicalSlug = userSlugCandidates(row)[0] ?? row.principalId;
+      const userId = row.userId ?? row.principalId;
 
-    const [stats, daily, recentIssues, recentActivity, topAgents, topProviders] = await Promise.all([
-      Promise.all(
-        PROFILE_WINDOWS.map((entry) =>
-          loadWindowStats(db, companyId, userId, entry.key, entry.label, windowStart(entry.days)),
+      const [stats, daily, recentIssues, recentActivity, topAgents, topProviders] = await Promise.all([
+        Promise.all(
+          PROFILE_WINDOWS.map((entry) =>
+            loadWindowStats(scopedDb, companyId, userId, entry.key, entry.label, windowStart(entry.days)),
+          ),
         ),
-      ),
-      loadDailyStats(db, companyId, userId),
-      db
-        .select({
-          id: issues.id,
-          identifier: issues.identifier,
-          title: issues.title,
-          status: issues.status,
-          priority: issues.priority,
-          assigneeAgentId: issues.assigneeAgentId,
-          assigneeUserId: issues.assigneeUserId,
-          updatedAt: issues.updatedAt,
-          completedAt: issues.completedAt,
-        })
-        .from(issues)
-        .where(
-          and(
-            eq(issues.companyId, companyId),
-            isNull(issues.hiddenAt),
-            userIssueInvolvementSql(companyId, userId),
-          ),
-        )
-        .orderBy(desc(issues.updatedAt))
-        .limit(8),
-      db
-        .select({
-          id: activityLog.id,
-          action: activityLog.action,
-          entityType: activityLog.entityType,
-          entityId: activityLog.entityId,
-          details: activityLog.details,
-          createdAt: activityLog.createdAt,
-        })
-        .from(activityLog)
-        .where(
-          and(
-            eq(activityLog.companyId, companyId),
-            eq(activityLog.actorType, "user"),
-            eq(activityLog.actorId, userId),
-          ),
-        )
-        .orderBy(desc(activityLog.createdAt))
-        .limit(12),
-      db
-        .select({
-          agentId: costEvents.agentId,
-          agentName: agents.name,
-          costCents: sumNumber(costEvents.costCents),
-          inputTokens: sumNumber(costEvents.inputTokens),
-          cachedInputTokens: sumNumber(costEvents.cachedInputTokens),
-          outputTokens: sumNumber(costEvents.outputTokens),
-        })
-        .from(costEvents)
-        .innerJoin(issues, and(eq(issues.id, costEvents.issueId), eq(issues.companyId, costEvents.companyId)))
-        .leftJoin(agents, eq(agents.id, costEvents.agentId))
-        .where(and(eq(costEvents.companyId, companyId), userIssueInvolvementSql(companyId, userId)))
-        .groupBy(costEvents.agentId, agents.name)
-        .orderBy(desc(sumNumber(costEvents.costCents)))
-        .limit(5),
-      db
-        .select({
-          provider: costEvents.provider,
-          biller: costEvents.biller,
-          model: costEvents.model,
-          costCents: sumNumber(costEvents.costCents),
-          inputTokens: sumNumber(costEvents.inputTokens),
-          cachedInputTokens: sumNumber(costEvents.cachedInputTokens),
-          outputTokens: sumNumber(costEvents.outputTokens),
-        })
-        .from(costEvents)
-        .innerJoin(issues, and(eq(issues.id, costEvents.issueId), eq(issues.companyId, costEvents.companyId)))
-        .where(and(eq(costEvents.companyId, companyId), userIssueInvolvementSql(companyId, userId)))
-        .groupBy(costEvents.provider, costEvents.biller, costEvents.model)
-        .orderBy(desc(sumNumber(costEvents.costCents)))
-        .limit(5),
-    ]);
+        loadDailyStats(scopedDb, companyId, userId),
+        scopedDb
+          .select({
+            id: issues.id,
+            identifier: issues.identifier,
+            title: issues.title,
+            status: issues.status,
+            priority: issues.priority,
+            assigneeAgentId: issues.assigneeAgentId,
+            assigneeUserId: issues.assigneeUserId,
+            updatedAt: issues.updatedAt,
+            completedAt: issues.completedAt,
+          })
+          .from(issues)
+          .where(
+            and(
+              eq(issues.companyId, companyId),
+              isNull(issues.hiddenAt),
+              userIssueInvolvementSql(companyId, userId),
+            ),
+          )
+          .orderBy(desc(issues.updatedAt))
+          .limit(8),
+        scopedDb
+          .select({
+            id: activityLog.id,
+            action: activityLog.action,
+            entityType: activityLog.entityType,
+            entityId: activityLog.entityId,
+            details: activityLog.details,
+            createdAt: activityLog.createdAt,
+          })
+          .from(activityLog)
+          .where(
+            and(
+              eq(activityLog.companyId, companyId),
+              eq(activityLog.actorType, "user"),
+              eq(activityLog.actorId, userId),
+            ),
+          )
+          .orderBy(desc(activityLog.createdAt))
+          .limit(12),
+        scopedDb
+          .select({
+            agentId: costEvents.agentId,
+            agentName: agents.name,
+            costCents: sumNumber(costEvents.costCents),
+            inputTokens: sumNumber(costEvents.inputTokens),
+            cachedInputTokens: sumNumber(costEvents.cachedInputTokens),
+            outputTokens: sumNumber(costEvents.outputTokens),
+          })
+          .from(costEvents)
+          .innerJoin(issues, and(eq(issues.id, costEvents.issueId), eq(issues.companyId, costEvents.companyId)))
+          .leftJoin(agents, eq(agents.id, costEvents.agentId))
+          .where(and(eq(costEvents.companyId, companyId), userIssueInvolvementSql(companyId, userId)))
+          .groupBy(costEvents.agentId, agents.name)
+          .orderBy(desc(sumNumber(costEvents.costCents)))
+          .limit(5),
+        scopedDb
+          .select({
+            provider: costEvents.provider,
+            biller: costEvents.biller,
+            model: costEvents.model,
+            costCents: sumNumber(costEvents.costCents),
+            inputTokens: sumNumber(costEvents.inputTokens),
+            cachedInputTokens: sumNumber(costEvents.cachedInputTokens),
+            outputTokens: sumNumber(costEvents.outputTokens),
+          })
+          .from(costEvents)
+          .innerJoin(issues, and(eq(issues.id, costEvents.issueId), eq(issues.companyId, costEvents.companyId)))
+          .where(and(eq(costEvents.companyId, companyId), userIssueInvolvementSql(companyId, userId)))
+          .groupBy(costEvents.provider, costEvents.biller, costEvents.model)
+          .orderBy(desc(sumNumber(costEvents.costCents)))
+          .limit(5),
+      ]);
 
-    const user: UserProfileIdentity = {
-      id: userId,
-      slug: canonicalSlug,
-      name: row.name,
-      email: row.email,
-      image: row.image,
-      membershipRole: row.membershipRole,
-      membershipStatus: row.status,
-      joinedAt: row.createdAt,
-    };
+      const user: UserProfileIdentity = {
+        id: userId,
+        slug: canonicalSlug,
+        name: row.name,
+        email: row.email,
+        image: row.image,
+        membershipRole: row.membershipRole,
+        membershipStatus: row.status,
+        joinedAt: row.createdAt,
+      };
 
-    const payload: UserProfileResponse = {
-      user,
-      stats,
-      daily,
-      recentIssues: recentIssues.map((issue) => ({
-        ...issue,
-        status: issue.status as UserProfileResponse["recentIssues"][number]["status"],
-        priority: issue.priority as UserProfileResponse["recentIssues"][number]["priority"],
-      })),
-      recentActivity,
-      topAgents: topAgents.map((entry) => ({
-        ...entry,
-        costCents: Number(entry.costCents),
-        inputTokens: Number(entry.inputTokens),
-        cachedInputTokens: Number(entry.cachedInputTokens),
-        outputTokens: Number(entry.outputTokens),
-      })),
-      topProviders: topProviders.map((entry) => ({
-        ...entry,
-        costCents: Number(entry.costCents),
-        inputTokens: Number(entry.inputTokens),
-        cachedInputTokens: Number(entry.cachedInputTokens),
-        outputTokens: Number(entry.outputTokens),
-      })),
-    };
+      return {
+        user,
+        stats,
+        daily,
+        recentIssues: recentIssues.map((issue) => ({
+          ...issue,
+          status: issue.status as UserProfileResponse["recentIssues"][number]["status"],
+          priority: issue.priority as UserProfileResponse["recentIssues"][number]["priority"],
+        })),
+        recentActivity,
+        topAgents: topAgents.map((entry) => ({
+          ...entry,
+          costCents: Number(entry.costCents),
+          inputTokens: Number(entry.inputTokens),
+          cachedInputTokens: Number(entry.cachedInputTokens),
+          outputTokens: Number(entry.outputTokens),
+        })),
+        topProviders: topProviders.map((entry) => ({
+          ...entry,
+          costCents: Number(entry.costCents),
+          inputTokens: Number(entry.inputTokens),
+          cachedInputTokens: Number(entry.cachedInputTokens),
+          outputTokens: Number(entry.outputTokens),
+        })),
+      } satisfies UserProfileResponse;
+    });
 
     res.json(payload);
   });

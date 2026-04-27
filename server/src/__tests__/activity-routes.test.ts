@@ -18,6 +18,15 @@ const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
   getByIdentifier: vi.fn(),
 }));
+const mockWithCompanyRls = vi.hoisted(() =>
+  vi.fn(async (_db: unknown, _companyId: string, operation: (scopedDb: unknown) => Promise<unknown>) =>
+    operation({ scoped: true }),
+  ),
+);
+
+vi.mock("../services/company-rls.js", () => ({
+  withCompanyRls: mockWithCompanyRls,
+}));
 
 vi.mock("../services/activity.js", () => ({
   activityService: () => mockActivityService,
@@ -92,6 +101,7 @@ describe.sequential("activity routes", () => {
     for (const mock of Object.values(mockActivityService)) mock.mockReset();
     for (const mock of Object.values(mockHeartbeatService)) mock.mockReset();
     for (const mock of Object.values(mockIssueService)) mock.mockReset();
+    mockWithCompanyRls.mockClear();
   });
 
   it("limits company activity lists by default", async () => {
@@ -101,6 +111,11 @@ describe.sequential("activity routes", () => {
     const res = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/companies/company-1/activity"));
 
     expect(res.status).toBe(200);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(
+      expect.anything(),
+      "company-1",
+      expect.any(Function),
+    );
     expect(mockActivityService.list).toHaveBeenCalledWith({
       companyId: "company-1",
       agentId: undefined,
@@ -119,6 +134,11 @@ describe.sequential("activity routes", () => {
     );
 
     expect(res.status).toBe(200);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(
+      expect.anything(),
+      "company-1",
+      expect.any(Function),
+    );
     expect(mockActivityService.list).toHaveBeenCalledWith({
       companyId: "company-1",
       agentId: undefined,
@@ -162,7 +182,38 @@ describe.sequential("activity routes", () => {
       }));
 
     expect(res.status).toBe(403);
+    expect(mockWithCompanyRls).not.toHaveBeenCalled();
     expect(mockActivityService.create).not.toHaveBeenCalled();
+  });
+
+  it("creates activity events inside company RLS scope", async () => {
+    mockActivityService.create.mockResolvedValue({ id: "activity-1" });
+
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .post("/api/companies/company-1/activity")
+      .send({
+        actorId: "user-1",
+        action: "test.event",
+        entityType: "issue",
+        entityId: "issue-1",
+      }));
+
+    expect(res.status).toBe(201);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(
+      expect.anything(),
+      "company-1",
+      expect.any(Function),
+    );
+    expect(mockActivityService.create).toHaveBeenCalledWith({
+      companyId: "company-1",
+      actorId: "user-1",
+      action: "test.event",
+      entityType: "issue",
+      entityId: "issue-1",
+      actorType: "system",
+      details: null,
+    });
   });
 
   it("requires company access before listing issues for another company's run", async () => {

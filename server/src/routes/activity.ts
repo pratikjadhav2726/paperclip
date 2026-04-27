@@ -2,6 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import { validate } from "../middleware/validate.js";
+import { withCompanyRls } from "../services/company-rls.js";
 import { activityService, normalizeActivityLimit } from "../services/activity.js";
 import { assertAuthenticated, assertBoard, assertCompanyAccess } from "./authz.js";
 import { heartbeatService, issueService } from "../services/index.js";
@@ -19,7 +20,6 @@ const createActivitySchema = z.object({
 
 export function activityRoutes(db: Db) {
   const router = Router();
-  const svc = activityService(db);
   const heartbeat = heartbeatService(db);
   const issueSvc = issueService(db);
 
@@ -41,7 +41,7 @@ export function activityRoutes(db: Db) {
       entityId: req.query.entityId as string | undefined,
       limit: normalizeActivityLimit(Number(req.query.limit)),
     };
-    const result = await svc.list(filters);
+    const result = await withCompanyRls(db, companyId, (scopedDb) => activityService(scopedDb).list(filters));
     res.json(result);
   });
 
@@ -49,11 +49,13 @@ export function activityRoutes(db: Db) {
     assertBoard(req);
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    const event = await svc.create({
-      companyId,
-      ...req.body,
-      details: req.body.details ? sanitizeRecord(req.body.details) : null,
-    });
+    const event = await withCompanyRls(db, companyId, (scopedDb) =>
+      activityService(scopedDb).create({
+        companyId,
+        ...req.body,
+        details: req.body.details ? sanitizeRecord(req.body.details) : null,
+      }),
+    );
     res.status(201).json(event);
   });
 
@@ -65,7 +67,7 @@ export function activityRoutes(db: Db) {
       return;
     }
     assertCompanyAccess(req, issue.companyId);
-    const result = await svc.forIssue(issue.id);
+    const result = await activityService(db).forIssue(issue.id);
     res.json(result);
   });
 
@@ -77,7 +79,7 @@ export function activityRoutes(db: Db) {
       return;
     }
     assertCompanyAccess(req, issue.companyId);
-    const result = await svc.runsForIssue(issue.companyId, issue.id);
+    const result = await activityService(db).runsForIssue(issue.companyId, issue.id);
     res.json(result);
   });
 
@@ -90,7 +92,7 @@ export function activityRoutes(db: Db) {
       return;
     }
     assertCompanyAccess(req, run.companyId);
-    const result = await svc.issuesForRun(runId);
+    const result = await activityService(db).issuesForRun(runId);
     res.json(result);
   });
 

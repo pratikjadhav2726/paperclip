@@ -2,6 +2,7 @@ import { Router, type Request, type Response } from "express";
 import type { Db } from "@paperclipai/db";
 import { upsertSidebarOrderPreferenceSchema } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
+import { withCompanyRls } from "../services/company-rls.js";
 import { logActivity, sidebarPreferenceService } from "../services/index.js";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 
@@ -16,18 +17,17 @@ function requireBoardUserId(req: Request, res: Response): string | null {
 
 export function sidebarPreferenceRoutes(db: Db) {
   const router = Router();
-  const svc = sidebarPreferenceService(db);
 
   router.get("/sidebar-preferences/me", async (req, res) => {
     const userId = requireBoardUserId(req, res);
     if (!userId) return;
-    res.json(await svc.getCompanyOrder(userId));
+    res.json(await sidebarPreferenceService(db).getCompanyOrder(userId));
   });
 
   router.put("/sidebar-preferences/me", validate(upsertSidebarOrderPreferenceSchema), async (req, res) => {
     const userId = requireBoardUserId(req, res);
     if (!userId) return;
-    res.json(await svc.upsertCompanyOrder(userId, req.body.orderedIds));
+    res.json(await sidebarPreferenceService(db).upsertCompanyOrder(userId, req.body.orderedIds));
   });
 
   router.get("/companies/:companyId/sidebar-preferences/me", async (req, res) => {
@@ -35,7 +35,11 @@ export function sidebarPreferenceRoutes(db: Db) {
     assertCompanyAccess(req, companyId);
     const userId = requireBoardUserId(req, res);
     if (!userId) return;
-    res.json(await svc.getProjectOrder(companyId, userId));
+    res.json(
+      await withCompanyRls(db, companyId, (scopedDb) =>
+        sidebarPreferenceService(scopedDb).getProjectOrder(companyId, userId),
+      ),
+    );
   });
 
   router.put(
@@ -47,21 +51,28 @@ export function sidebarPreferenceRoutes(db: Db) {
       const userId = requireBoardUserId(req, res);
       if (!userId) return;
 
-      const result = await svc.upsertProjectOrder(companyId, userId, req.body.orderedIds);
-      const actor = getActorInfo(req);
-      await logActivity(db, {
-        companyId,
-        actorType: actor.actorType,
-        actorId: actor.actorId,
-        agentId: actor.agentId,
-        runId: actor.runId,
-        action: "sidebar_preferences.project_order_updated",
-        entityType: "company",
-        entityId: companyId,
-        details: {
+      const result = await withCompanyRls(db, companyId, async (scopedDb) => {
+        const updated = await sidebarPreferenceService(scopedDb).upsertProjectOrder(
+          companyId,
           userId,
-          orderedIds: result.orderedIds,
-        },
+          req.body.orderedIds,
+        );
+        const actor = getActorInfo(req);
+        await logActivity(scopedDb, {
+          companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          action: "sidebar_preferences.project_order_updated",
+          entityType: "company",
+          entityId: companyId,
+          details: {
+            userId,
+            orderedIds: updated.orderedIds,
+          },
+        });
+        return updated;
       });
       res.json(result);
     },
