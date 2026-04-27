@@ -30,19 +30,23 @@ import { assertCompanyAccess, getActorInfo } from "./authz.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { environmentService } from "../services/environments.js";
 import { executionWorkspaceService } from "../services/execution-workspaces.js";
+import { withCompanyRls } from "../services/company-rls.js";
 
 export function environmentRoutes(
   db: Db,
   options: { pluginWorkerManager?: PluginWorkerManager } = {},
 ) {
   const router = Router();
-  const agents = agentService(db);
-  const access = accessService(db);
-  const svc = environmentService(db);
-  const executionWorkspaces = executionWorkspaceService(db);
-  const issues = issueService(db);
-  const projects = projectService(db);
-  const secrets = secretService(db);
+  const rootSvc = environmentService(db);
+  const scopedServices = (scopedDb: Db) => ({
+    agents: agentService(scopedDb),
+    access: accessService(scopedDb),
+    svc: environmentService(scopedDb),
+    executionWorkspaces: executionWorkspaceService(scopedDb),
+    issues: issueService(scopedDb),
+    projects: projectService(scopedDb),
+    secrets: secretService(scopedDb),
+  });
 
   function parseObject(value: unknown): Record<string, unknown> {
     return value && typeof value === "object" && !Array.isArray(value)
@@ -55,8 +59,8 @@ export function environmentRoutes(
     return Boolean((agent.permissions as Record<string, unknown>).canCreateAgents);
   }
 
-  async function assertCanMutateEnvironments(req: Request, companyId: string) {
-    assertCompanyAccess(req, companyId);
+  async function assertCanMutateEnvironments(req: Request, companyId: string, scopedDb: Db) {
+    const { access, agents } = scopedServices(scopedDb);
 
     if (req.actor.type === "board") {
       if (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin) return;
@@ -84,8 +88,8 @@ export function environmentRoutes(
     throw forbidden("Missing permission: environments:manage");
   }
 
-  async function actorCanReadEnvironmentConfigurations(req: Request, companyId: string) {
-    assertCompanyAccess(req, companyId);
+  async function actorCanReadEnvironmentConfigurations(req: Request, companyId: string, scopedDb: Db) {
+    const { access, agents } = scopedServices(scopedDb);
 
     if (req.actor.type === "board") {
       if (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin) return true;
@@ -149,11 +153,15 @@ export function environmentRoutes(
   router.get("/companies/:companyId/environments", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    const rows = await svc.list(companyId, {
-      status: req.query.status as string | undefined,
-      driver: req.query.driver as string | undefined,
-    });
-    const canReadConfigs = await actorCanReadEnvironmentConfigurations(req, companyId);
+    const rows = await withCompanyRls(db, companyId, (scopedDb) =>
+      scopedServices(scopedDb).svc.list(companyId, {
+        status: req.query.status as string | undefined,
+        driver: req.query.driver as string | undefined,
+      }),
+    );
+    const canReadConfigs = await withCompanyRls(db, companyId, (scopedDb) =>
+      actorCanReadEnvironmentConfigurations(req, companyId, scopedDb),
+    );
     if (canReadConfigs) {
       res.json(rows);
       return;
@@ -193,50 +201,57 @@ export function environmentRoutes(
 
   router.post("/companies/:companyId/environments", validate(createEnvironmentSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
-    await assertCanMutateEnvironments(req, companyId);
+    assertCompanyAccess(req, companyId);
     const actor = getActorInfo(req);
-    const input = {
-      ...req.body,
-      config: await normalizeEnvironmentConfigForPersistence({
-        db,
+    const environment = await withCompanyRls(db, companyId, async (scopedDb) => {
+      await assertCanMutateEnvironments(req, companyId, scopedDb);
+      const { svc } = scopedServices(scopedDb);
+      const input = {
+        ...req.body,
+        config: await normalizeEnvironmentConfigForPersistence({
+          db: scopedDb,
+          companyId,
+          environmentName: req.body.name,
+          driver: req.body.driver,
+          config: req.body.config,
+          actor: {
+            agentId: actor.agentId,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+          },
+          pluginWorkerManager: options.pluginWorkerManager,
+        }),
+      };
+      const created = await svc.create(companyId, input);
+      await logActivity(scopedDb, {
         companyId,
-        environmentName: req.body.name,
-        driver: req.body.driver,
-        config: req.body.config,
-        actor: {
-          agentId: actor.agentId,
-          userId: actor.actorType === "user" ? actor.actorId : null,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "environment.created",
+        entityType: "environment",
+        entityId: created.id,
+        details: {
+          name: created.name,
+          driver: created.driver,
+          status: created.status,
         },
-        pluginWorkerManager: options.pluginWorkerManager,
-      }),
-    };
-    const environment = await svc.create(companyId, input);
-    await logActivity(db, {
-      companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "environment.created",
-      entityType: "environment",
-      entityId: environment.id,
-      details: {
-        name: environment.name,
-        driver: environment.driver,
-        status: environment.status,
-      },
+      });
+      return created;
     });
     res.status(201).json(environment);
   });
 
   router.get("/environments/:id", async (req, res) => {
-    const environment = await svc.getById(req.params.id as string);
+    const environment = await rootSvc.getById(req.params.id as string);
     if (!environment) {
       res.status(404).json({ error: "Environment not found" });
       return;
     }
     assertCompanyAccess(req, environment.companyId);
-    const canReadConfigs = await actorCanReadEnvironmentConfigurations(req, environment.companyId);
+    const canReadConfigs = await withCompanyRls(db, environment.companyId, (scopedDb) =>
+      actorCanReadEnvironmentConfigurations(req, environment.companyId, scopedDb),
+    );
     if (canReadConfigs) {
       res.json(environment);
       return;
@@ -245,30 +260,36 @@ export function environmentRoutes(
   });
 
   router.get("/environments/:id/leases", async (req, res) => {
-    const environment = await svc.getById(req.params.id as string);
+    const environment = await rootSvc.getById(req.params.id as string);
     if (!environment) {
       res.status(404).json({ error: "Environment not found" });
       return;
     }
     assertCompanyAccess(req, environment.companyId);
-    const canReadConfigs = await actorCanReadEnvironmentConfigurations(req, environment.companyId);
+    const canReadConfigs = await withCompanyRls(db, environment.companyId, (scopedDb) =>
+      actorCanReadEnvironmentConfigurations(req, environment.companyId, scopedDb),
+    );
     if (!canReadConfigs) {
       throw forbidden("Missing permission: environments:manage");
     }
-    const leases = await svc.listLeases(environment.id, {
-      status: req.query.status as string | undefined,
-    });
+    const leases = await withCompanyRls(db, environment.companyId, (scopedDb) =>
+      scopedServices(scopedDb).svc.listLeases(environment.id, {
+        status: req.query.status as string | undefined,
+      }),
+    );
     res.json(leases);
   });
 
   router.get("/environment-leases/:leaseId", async (req, res) => {
-    const lease = await svc.getLeaseById(req.params.leaseId as string);
+    const lease = await rootSvc.getLeaseById(req.params.leaseId as string);
     if (!lease) {
       res.status(404).json({ error: "Environment lease not found" });
       return;
     }
     assertCompanyAccess(req, lease.companyId);
-    const canReadConfigs = await actorCanReadEnvironmentConfigurations(req, lease.companyId);
+    const canReadConfigs = await withCompanyRls(db, lease.companyId, (scopedDb) =>
+      actorCanReadEnvironmentConfigurations(req, lease.companyId, scopedDb),
+    );
     if (!canReadConfigs) {
       throw forbidden("Missing permission: environments:manage");
     }
@@ -276,12 +297,12 @@ export function environmentRoutes(
   });
 
   router.patch("/environments/:id", validate(updateEnvironmentSchema), async (req, res) => {
-    const existing = await svc.getById(req.params.id as string);
+    const existing = await rootSvc.getById(req.params.id as string);
     if (!existing) {
       res.status(404).json({ error: "Environment not found" });
       return;
     }
-    await assertCanMutateEnvironments(req, existing.companyId);
+    assertCompanyAccess(req, existing.companyId);
     const actor = getActorInfo(req);
     const nextDriver = req.body.driver ?? existing.driver;
     const nextName = req.body.name ?? existing.name;
@@ -301,7 +322,7 @@ export function environmentRoutes(
       ...(req.body.config !== undefined || req.body.driver !== undefined
         ? {
             config: await normalizeEnvironmentConfigForPersistence({
-              db,
+              db: db,
               companyId: existing.companyId,
               environmentName: nextName,
               driver: nextDriver,
@@ -315,90 +336,106 @@ export function environmentRoutes(
           }
         : {}),
     };
-    const environment = await svc.update(existing.id, patch);
+    const environment = await withCompanyRls(db, existing.companyId, async (scopedDb) => {
+      await assertCanMutateEnvironments(req, existing.companyId, scopedDb);
+      const { svc } = scopedServices(scopedDb);
+      const updated = await svc.update(existing.id, patch);
+      if (!updated) return null;
+      await logActivity(scopedDb, {
+        companyId: updated.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "environment.updated",
+        entityType: "environment",
+        entityId: updated.id,
+        details: summarizeEnvironmentUpdate(patch as Record<string, unknown>, updated),
+      });
+      return updated;
+    });
     if (!environment) {
       res.status(404).json({ error: "Environment not found" });
       return;
     }
-    await logActivity(db, {
-      companyId: environment.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "environment.updated",
-      entityType: "environment",
-      entityId: environment.id,
-      details: summarizeEnvironmentUpdate(patch as Record<string, unknown>, environment),
-    });
     res.json(environment);
   });
 
   router.delete("/environments/:id", async (req, res) => {
-    const existing = await svc.getById(req.params.id as string);
+    const existing = await rootSvc.getById(req.params.id as string);
     if (!existing) {
       res.status(404).json({ error: "Environment not found" });
       return;
     }
-    await assertCanMutateEnvironments(req, existing.companyId);
-    await Promise.all([
-      executionWorkspaces.clearEnvironmentSelection(existing.companyId, existing.id),
-      issues.clearExecutionWorkspaceEnvironmentSelection(existing.companyId, existing.id),
-      projects.clearExecutionWorkspaceEnvironmentSelection(existing.companyId, existing.id),
-    ]);
-    const removed = await svc.remove(existing.id);
+    assertCompanyAccess(req, existing.companyId);
+    const removed = await withCompanyRls(db, existing.companyId, async (scopedDb) => {
+      await assertCanMutateEnvironments(req, existing.companyId, scopedDb);
+      const { executionWorkspaces, issues, projects, svc, secrets } = scopedServices(scopedDb);
+      await Promise.all([
+        executionWorkspaces.clearEnvironmentSelection(existing.companyId, existing.id),
+        issues.clearExecutionWorkspaceEnvironmentSelection(existing.companyId, existing.id),
+        projects.clearExecutionWorkspaceEnvironmentSelection(existing.companyId, existing.id),
+      ]);
+      const next = await svc.remove(existing.id);
+      if (!next) return null;
+      const secretId = readSshEnvironmentPrivateKeySecretId(existing);
+      if (secretId) {
+        await secrets.remove(secretId);
+      }
+      const actor = getActorInfo(req);
+      await logActivity(scopedDb, {
+        companyId: existing.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "environment.deleted",
+        entityType: "environment",
+        entityId: next.id,
+        details: {
+          name: next.name,
+          driver: next.driver,
+          status: next.status,
+        },
+      });
+      return next;
+    });
     if (!removed) {
       res.status(404).json({ error: "Environment not found" });
       return;
     }
-    const secretId = readSshEnvironmentPrivateKeySecretId(existing);
-    if (secretId) {
-      await secrets.remove(secretId);
-    }
-    const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: existing.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "environment.deleted",
-      entityType: "environment",
-      entityId: removed.id,
-      details: {
-        name: removed.name,
-        driver: removed.driver,
-        status: removed.status,
-      },
-    });
     res.json(removed);
   });
 
   router.post("/environments/:id/probe", async (req, res) => {
-    const environment = await svc.getById(req.params.id as string);
+    const environment = await rootSvc.getById(req.params.id as string);
     if (!environment) {
       res.status(404).json({ error: "Environment not found" });
       return;
     }
-    await assertCanMutateEnvironments(req, environment.companyId);
+    assertCompanyAccess(req, environment.companyId);
     const actor = getActorInfo(req);
-    const probe = await probeEnvironment(db, environment, {
-      pluginWorkerManager: options.pluginWorkerManager,
-    });
-    await logActivity(db, {
-      companyId: environment.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "environment.probed",
-      entityType: "environment",
-      entityId: environment.id,
-      details: {
-        driver: environment.driver,
-        ok: probe.ok,
-        summary: probe.summary,
-      },
+    const probe = await withCompanyRls(db, environment.companyId, async (scopedDb) => {
+      await assertCanMutateEnvironments(req, environment.companyId, scopedDb);
+      const result = await probeEnvironment(scopedDb, environment, {
+        pluginWorkerManager: options.pluginWorkerManager,
+      });
+      await logActivity(scopedDb, {
+        companyId: environment.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "environment.probed",
+        entityType: "environment",
+        entityId: environment.id,
+        details: {
+          driver: environment.driver,
+          ok: result.ok,
+          summary: result.summary,
+        },
+      });
+      return result;
     });
     res.json(probe);
   });
@@ -408,48 +445,52 @@ export function environmentRoutes(
     validate(probeEnvironmentConfigSchema),
     async (req, res) => {
       const companyId = req.params.companyId as string;
-      await assertCanMutateEnvironments(req, companyId);
+      assertCompanyAccess(req, companyId);
       const actor = getActorInfo(req);
-      const normalizedConfig = await normalizeEnvironmentConfigForProbe({
-        db,
-        driver: req.body.driver,
-        config: req.body.config,
-        pluginWorkerManager: options.pluginWorkerManager,
-      });
-      const environment = {
-        id: "unsaved",
-        companyId,
-        name: req.body.name?.trim() || "Unsaved environment",
-        description: req.body.description ?? null,
-        driver: req.body.driver,
-        status: "active" as const,
-        config: normalizedConfig,
-        metadata: req.body.metadata ?? null,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      };
-      const probe = await probeEnvironment(db, environment, {
-        pluginWorkerManager: options.pluginWorkerManager,
-        resolvedConfig: {
+      const probe = await withCompanyRls(db, companyId, async (scopedDb) => {
+        await assertCanMutateEnvironments(req, companyId, scopedDb);
+        const normalizedConfig = await normalizeEnvironmentConfigForProbe({
+          db: scopedDb,
           driver: req.body.driver,
+          config: req.body.config,
+          pluginWorkerManager: options.pluginWorkerManager,
+        });
+        const environment = {
+          id: "unsaved",
+          companyId,
+          name: req.body.name?.trim() || "Unsaved environment",
+          description: req.body.description ?? null,
+          driver: req.body.driver,
+          status: "active" as const,
           config: normalizedConfig,
-        } as ParsedEnvironmentConfig,
-      });
-      await logActivity(db, {
-        companyId,
-        actorType: actor.actorType,
-        actorId: actor.actorId,
-        agentId: actor.agentId,
-        runId: actor.runId,
-        action: "environment.probed_unsaved",
-        entityType: "environment",
-        entityId: "unsaved",
-        details: {
-          driver: environment.driver,
-          ok: probe.ok,
-          summary: probe.summary,
-          configTopLevelKeyCount: Object.keys(environment.config).length,
-        },
+          metadata: req.body.metadata ?? null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+        const result = await probeEnvironment(scopedDb, environment, {
+          pluginWorkerManager: options.pluginWorkerManager,
+          resolvedConfig: {
+            driver: req.body.driver,
+            config: normalizedConfig,
+          } as ParsedEnvironmentConfig,
+        });
+        await logActivity(scopedDb, {
+          companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          action: "environment.probed_unsaved",
+          entityType: "environment",
+          entityId: "unsaved",
+          details: {
+            driver: environment.driver,
+            ok: result.ok,
+            summary: result.summary,
+            configTopLevelKeyCount: Object.keys(environment.config).length,
+          },
+        });
+        return result;
       });
       res.json(probe);
     },

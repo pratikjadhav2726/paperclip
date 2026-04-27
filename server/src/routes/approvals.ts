@@ -19,6 +19,7 @@ import {
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 import { redactEventPayload } from "../redaction.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
+import { withCompanyRls } from "../services/company-rls.js";
 
 function redactApprovalPayload<T extends { payload: Record<string, unknown> }>(approval: T): T {
   return {
@@ -53,7 +54,9 @@ export function approvalRoutes(
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const status = req.query.status as string | undefined;
-    const result = await svc.list(companyId, status);
+    const result = await withCompanyRls(db, companyId, (scopedDb) =>
+      approvalService(scopedDb).list(companyId, status),
+    );
     res.json(result.map((approval) => redactApprovalPayload(approval)));
   });
 
@@ -77,45 +80,49 @@ export function approvalRoutes(
       : [];
     const uniqueIssueIds = Array.from(new Set(issueIds));
     const { issueIds: _issueIds, ...approvalInput } = req.body;
-    const normalizedPayload =
-      approvalInput.type === "hire_agent"
-        ? await secretsSvc.normalizeHireApprovalPayloadForPersistence(
-            companyId,
-            approvalInput.payload,
-            { strictMode: strictSecretsMode },
-          )
-        : approvalInput.payload;
-
     const actor = getActorInfo(req);
-    const approval = await svc.create(companyId, {
-      ...approvalInput,
-      payload: normalizedPayload,
-      requestedByUserId: actor.actorType === "user" ? actor.actorId : null,
-      requestedByAgentId:
-        approvalInput.requestedByAgentId ?? (actor.actorType === "agent" ? actor.actorId : null),
-      status: "pending",
-      decisionNote: null,
-      decidedByUserId: null,
-      decidedAt: null,
-      updatedAt: new Date(),
-    });
+    const approval = await withCompanyRls(db, companyId, async (scopedDb) => {
+      const scopedApprovals = approvalService(scopedDb);
+      const scopedIssueApprovals = issueApprovalService(scopedDb);
+      const scopedSecrets = secretService(scopedDb);
+      const normalizedPayload =
+        approvalInput.type === "hire_agent"
+          ? await scopedSecrets.normalizeHireApprovalPayloadForPersistence(
+              companyId,
+              approvalInput.payload,
+              { strictMode: strictSecretsMode },
+            )
+          : approvalInput.payload;
 
-    if (uniqueIssueIds.length > 0) {
-      await issueApprovalsSvc.linkManyForApproval(approval.id, uniqueIssueIds, {
-        agentId: actor.agentId,
-        userId: actor.actorType === "user" ? actor.actorId : null,
+      const created = await scopedApprovals.create(companyId, {
+        ...approvalInput,
+        payload: normalizedPayload,
+        requestedByUserId: actor.actorType === "user" ? actor.actorId : null,
+        requestedByAgentId:
+          approvalInput.requestedByAgentId ?? (actor.actorType === "agent" ? actor.actorId : null),
+        status: "pending",
+        decisionNote: null,
+        decidedByUserId: null,
+        decidedAt: null,
+        updatedAt: new Date(),
       });
-    }
-
-    await logActivity(db, {
-      companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      action: "approval.created",
-      entityType: "approval",
-      entityId: approval.id,
-      details: { type: approval.type, issueIds: uniqueIssueIds },
+      if (uniqueIssueIds.length > 0) {
+        await scopedIssueApprovals.linkManyForApproval(created.id, uniqueIssueIds, {
+          agentId: actor.agentId,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+        });
+      }
+      await logActivity(scopedDb, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        action: "approval.created",
+        entityType: "approval",
+        entityId: created.id,
+        details: { type: created.type, issueIds: uniqueIssueIds },
+      });
+      return created;
     });
 
     res.status(201).json(redactApprovalPayload(approval));

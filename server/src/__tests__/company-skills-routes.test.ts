@@ -19,9 +19,17 @@ const mockCompanySkillService = vi.hoisted(() => ({
 const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockTrackSkillImported = vi.hoisted(() => vi.fn());
 const mockGetTelemetryClient = vi.hoisted(() => vi.fn());
+const mockWithCompanyRls = vi.hoisted(() =>
+  vi.fn(async (_db: unknown, _companyId: string, operation: (scopedDb: unknown) => Promise<unknown>) =>
+    operation({ scoped: true }),
+  ),
+);
 
 function registerModuleMocks() {
   vi.doMock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
+  vi.doMock("../services/company-rls.js", () => ({
+    withCompanyRls: mockWithCompanyRls,
+  }));
 
   vi.doMock("@paperclipai/shared/telemetry", () => ({
     trackSkillImported: mockTrackSkillImported,
@@ -81,12 +89,14 @@ describe("company skill mutation permissions", () => {
     vi.doUnmock("../services/activity-log.js");
     vi.doUnmock("../services/agents.js");
     vi.doUnmock("../services/company-skills.js");
+    vi.doUnmock("../services/company-rls.js");
     vi.doUnmock("../services/index.js");
     vi.doUnmock("../routes/company-skills.js");
     vi.doUnmock("../routes/authz.js");
     vi.doUnmock("../middleware/index.js");
     registerModuleMocks();
     vi.clearAllMocks();
+    mockWithCompanyRls.mockClear();
     mockGetTelemetryClient.mockReturnValue({ track: vi.fn() });
     mockCompanySkillService.importFromSource.mockResolvedValue({
       imported: [],
@@ -114,6 +124,7 @@ describe("company skill mutation permissions", () => {
       .send({ source: "https://github.com/vercel-labs/agent-browser" });
 
     expect([200, 201], JSON.stringify(res.body)).toContain(res.status);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), "company-1", expect.any(Function));
     expect(res.body).toEqual({
       imported: [],
       warnings: [],
@@ -271,6 +282,23 @@ describe("company skill mutation permissions", () => {
       .send({ source: "https://github.com/vercel-labs/agent-browser" });
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), "company-1", expect.any(Function));
+    expect(mockCompanySkillService.importFromSource).not.toHaveBeenCalled();
+  });
+
+  it("checks company access before entering RLS scope for mutations", async () => {
+    const res = await request(await createApp({
+      type: "board",
+      userId: "local-board",
+      companyIds: ["company-2"],
+      source: "session",
+      isInstanceAdmin: false,
+    }))
+      .post("/api/companies/company-1/skills/import")
+      .send({ source: "https://github.com/vercel-labs/agent-browser" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(mockWithCompanyRls).not.toHaveBeenCalled();
     expect(mockCompanySkillService.importFromSource).not.toHaveBeenCalled();
   });
 

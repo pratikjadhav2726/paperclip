@@ -41,6 +41,11 @@ const mockValidatePluginEnvironmentDriverConfig = vi.hoisted(() => vi.fn());
 const mockValidatePluginSandboxProviderConfig = vi.hoisted(() => vi.fn());
 const mockListReadyPluginEnvironmentDrivers = vi.hoisted(() => vi.fn());
 const mockExecutionWorkspaceService = vi.hoisted(() => ({}));
+const mockWithCompanyRls = vi.hoisted(() =>
+  vi.fn(async (_db: unknown, _companyId: string, operation: (scopedDb: unknown) => Promise<unknown>) =>
+    operation({ scoped: true }),
+  ),
+);
 
 vi.mock("../services/index.js", () => ({
   accessService: () => mockAccessService,
@@ -71,6 +76,10 @@ vi.mock("../services/plugin-environment-driver.js", () => ({
   listReadyPluginEnvironmentDrivers: mockListReadyPluginEnvironmentDrivers,
   validatePluginEnvironmentDriverConfig: mockValidatePluginEnvironmentDriverConfig,
   validatePluginSandboxProviderConfig: mockValidatePluginSandboxProviderConfig,
+}));
+
+vi.mock("../services/company-rls.js", () => ({
+  withCompanyRls: mockWithCompanyRls,
 }));
 
 function createEnvironment() {
@@ -164,6 +173,7 @@ describe("environment routes", () => {
     }));
     mockListReadyPluginEnvironmentDrivers.mockReset();
     mockListReadyPluginEnvironmentDrivers.mockResolvedValue([]);
+    mockWithCompanyRls.mockClear();
   });
 
   it("lists company-scoped environments", async () => {
@@ -177,6 +187,7 @@ describe("environment routes", () => {
     const res = await request(app).get("/api/companies/company-1/environments?driver=local");
 
     expect(res.status).toBe(200);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), "company-1", expect.any(Function));
     expect(res.body).toHaveLength(1);
     expect(mockEnvironmentService.list).toHaveBeenCalledWith("company-1", {
       status: undefined,
@@ -296,6 +307,7 @@ describe("environment routes", () => {
     const res = await request(app).get("/api/environments/env-1");
 
     expect(res.status).toBe(200);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), "company-1", expect.any(Function));
     expect(res.body.config).toEqual({ shell: "zsh" });
     expect(res.body.metadata).toEqual({ source: "manual" });
     expect(res.body.configRedacted).toBeUndefined();

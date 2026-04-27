@@ -28,8 +28,16 @@ const mockSecretService = vi.hoisted(() => ({
 }));
 
 const mockLogActivity = vi.hoisted(() => vi.fn());
+const mockWithCompanyRls = vi.hoisted(() =>
+  vi.fn(async (_db: unknown, _companyId: string, operation: (scopedDb: unknown) => Promise<unknown>) =>
+    operation({ scoped: true }),
+  ),
+);
 
 function registerModuleMocks() {
+  vi.doMock("../services/company-rls.js", () => ({
+    withCompanyRls: mockWithCompanyRls,
+  }));
   vi.doMock("../services/index.js", () => ({
     approvalService: () => mockApprovalService,
     heartbeatService: () => mockHeartbeatService,
@@ -88,11 +96,13 @@ describe("approval routes idempotent retries", () => {
   beforeEach(() => {
     vi.resetModules();
     vi.doUnmock("../services/index.js");
+    vi.doUnmock("../services/company-rls.js");
     vi.doUnmock("../routes/approvals.js");
     vi.doUnmock("../routes/authz.js");
     vi.doUnmock("../middleware/index.js");
     registerModuleMocks();
     vi.clearAllMocks();
+    mockWithCompanyRls.mockClear();
     mockApprovalService.list.mockReset();
     mockApprovalService.getById.mockReset();
     mockApprovalService.create.mockReset();
@@ -185,6 +195,30 @@ describe("approval routes idempotent retries", () => {
 
     expect(res.status).toBe(403);
     expect(mockApprovalService.approve).not.toHaveBeenCalled();
+  });
+
+  it("runs company-scoped approval list inside RLS scope", async () => {
+    mockApprovalService.list.mockResolvedValue([]);
+
+    const res = await request(await createApp())
+      .get("/api/companies/company-1/approvals");
+
+    expect(res.status).toBe(200);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), "company-1", expect.any(Function));
+    expect(mockApprovalService.list).toHaveBeenCalledWith("company-1", undefined);
+  });
+
+  it("checks company access before entering RLS scope for company-scoped create", async () => {
+    const res = await request(await createApp({ companyIds: ["company-2"] }))
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "hire_agent",
+        payload: {},
+      });
+
+    expect(res.status).toBe(403);
+    expect(mockWithCompanyRls).not.toHaveBeenCalled();
+    expect(mockApprovalService.create).not.toHaveBeenCalled();
   });
 
   it("rejects approval revision requests for companies outside the caller scope", async () => {

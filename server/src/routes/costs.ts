@@ -18,6 +18,7 @@ import {
   logActivity,
 } from "../services/index.js";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
+import { withCompanyRls } from "../services/company-rls.js";
 import { fetchAllQuotaWindows } from "../services/quota-windows.js";
 import { badRequest } from "../errors.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
@@ -47,17 +48,21 @@ export function costRoutes(
   options: { pluginWorkerManager?: PluginWorkerManager } = {},
 ) {
   const router = Router();
-  const heartbeat = heartbeatService(db, {
+  const rootHeartbeat = heartbeatService(db, {
     pluginWorkerManager: options.pluginWorkerManager,
   });
   const budgetHooks = {
-    cancelWorkForScope: heartbeat.cancelBudgetScopeWork,
+    cancelWorkForScope: rootHeartbeat.cancelBudgetScopeWork,
   };
-  const costs = costService(db, budgetHooks);
-  const finance = financeService(db);
-  const budgets = budgetService(db, budgetHooks);
-  const companies = companyService(db);
-  const agents = agentService(db);
+  const rootAgents = agentService(db);
+
+  const scopedServices = (scopedDb: Db) => ({
+    costs: costService(scopedDb, budgetHooks),
+    finance: financeService(scopedDb),
+    budgets: budgetService(scopedDb, budgetHooks),
+    companies: companyService(scopedDb),
+    agents: agentService(scopedDb),
+  });
 
   router.post("/companies/:companyId/cost-events", validate(createCostEventSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
@@ -68,21 +73,25 @@ export function costRoutes(
       return;
     }
 
-    const event = await costs.createEvent(companyId, {
-      ...req.body,
-      occurredAt: new Date(req.body.occurredAt),
-    });
+    const event = await withCompanyRls(db, companyId, async (scopedDb) => {
+      const { costs } = scopedServices(scopedDb);
+      const created = await costs.createEvent(companyId, {
+        ...req.body,
+        occurredAt: new Date(req.body.occurredAt),
+      });
 
-    const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      action: "cost.reported",
-      entityType: "cost_event",
-      entityId: event.id,
-      details: { costCents: event.costCents, model: event.model },
+      const actor = getActorInfo(req);
+      await logActivity(scopedDb, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        action: "cost.reported",
+        entityType: "cost_event",
+        entityId: created.id,
+        details: { costCents: created.costCents, model: created.model },
+      });
+      return created;
     });
 
     res.status(201).json(event);
@@ -93,26 +102,30 @@ export function costRoutes(
     assertCompanyAccess(req, companyId);
     assertBoard(req);
 
-    const event = await finance.createEvent(companyId, {
-      ...req.body,
-      occurredAt: new Date(req.body.occurredAt),
-    });
+    const event = await withCompanyRls(db, companyId, async (scopedDb) => {
+      const { finance } = scopedServices(scopedDb);
+      const created = await finance.createEvent(companyId, {
+        ...req.body,
+        occurredAt: new Date(req.body.occurredAt),
+      });
 
-    const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      action: "finance_event.reported",
-      entityType: "finance_event",
-      entityId: event.id,
-      details: {
-        amountCents: event.amountCents,
-        biller: event.biller,
-        eventKind: event.eventKind,
-        direction: event.direction,
-      },
+      const actor = getActorInfo(req);
+      await logActivity(scopedDb, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        action: "finance_event.reported",
+        entityType: "finance_event",
+        entityId: created.id,
+        details: {
+          amountCents: created.amountCents,
+          biller: created.biller,
+          eventKind: created.eventKind,
+          direction: created.direction,
+        },
+      });
+      return created;
     });
 
     res.status(201).json(event);
@@ -122,7 +135,9 @@ export function costRoutes(
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const range = parseCostDateRange(req.query);
-    const summary = await costs.summary(companyId, range);
+    const summary = await withCompanyRls(db, companyId, (scopedDb) =>
+      scopedServices(scopedDb).costs.summary(companyId, range),
+    );
     res.json(summary);
   });
 
@@ -130,7 +145,9 @@ export function costRoutes(
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const range = parseCostDateRange(req.query);
-    const rows = await costs.byAgent(companyId, range);
+    const rows = await withCompanyRls(db, companyId, (scopedDb) =>
+      scopedServices(scopedDb).costs.byAgent(companyId, range),
+    );
     res.json(rows);
   });
 
@@ -138,7 +155,9 @@ export function costRoutes(
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const range = parseCostDateRange(req.query);
-    const rows = await costs.byAgentModel(companyId, range);
+    const rows = await withCompanyRls(db, companyId, (scopedDb) =>
+      scopedServices(scopedDb).costs.byAgentModel(companyId, range),
+    );
     res.json(rows);
   });
 
@@ -146,7 +165,9 @@ export function costRoutes(
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const range = parseCostDateRange(req.query);
-    const rows = await costs.byProvider(companyId, range);
+    const rows = await withCompanyRls(db, companyId, (scopedDb) =>
+      scopedServices(scopedDb).costs.byProvider(companyId, range),
+    );
     res.json(rows);
   });
 
@@ -154,7 +175,9 @@ export function costRoutes(
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const range = parseCostDateRange(req.query);
-    const rows = await costs.byBiller(companyId, range);
+    const rows = await withCompanyRls(db, companyId, (scopedDb) =>
+      scopedServices(scopedDb).costs.byBiller(companyId, range),
+    );
     res.json(rows);
   });
 
@@ -162,7 +185,9 @@ export function costRoutes(
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const range = parseCostDateRange(req.query);
-    const summary = await finance.summary(companyId, range);
+    const summary = await withCompanyRls(db, companyId, (scopedDb) =>
+      scopedServices(scopedDb).finance.summary(companyId, range),
+    );
     res.json(summary);
   });
 
@@ -170,7 +195,9 @@ export function costRoutes(
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const range = parseCostDateRange(req.query);
-    const rows = await finance.byBiller(companyId, range);
+    const rows = await withCompanyRls(db, companyId, (scopedDb) =>
+      scopedServices(scopedDb).finance.byBiller(companyId, range),
+    );
     res.json(rows);
   });
 
@@ -178,7 +205,9 @@ export function costRoutes(
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const range = parseCostDateRange(req.query);
-    const rows = await finance.byKind(companyId, range);
+    const rows = await withCompanyRls(db, companyId, (scopedDb) =>
+      scopedServices(scopedDb).finance.byKind(companyId, range),
+    );
     res.json(rows);
   });
 
@@ -187,14 +216,18 @@ export function costRoutes(
     assertCompanyAccess(req, companyId);
     const range = parseCostDateRange(req.query);
     const limit = parseCostLimit(req.query);
-    const rows = await finance.list(companyId, range, limit);
+    const rows = await withCompanyRls(db, companyId, (scopedDb) =>
+      scopedServices(scopedDb).finance.list(companyId, range, limit),
+    );
     res.json(rows);
   });
 
   router.get("/companies/:companyId/costs/window-spend", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    const rows = await costs.windowSpend(companyId);
+    const rows = await withCompanyRls(db, companyId, (scopedDb) =>
+      scopedServices(scopedDb).costs.windowSpend(companyId),
+    );
     res.json(rows);
   });
 
@@ -204,7 +237,9 @@ export function costRoutes(
     assertBoard(req);
     // validate companyId resolves to a real company so the "__none__" sentinel
     // and any forged ids are rejected before we touch provider credentials
-    const company = await companies.getById(companyId);
+    const company = await withCompanyRls(db, companyId, (scopedDb) =>
+      scopedServices(scopedDb).companies.getById(companyId),
+    );
     if (!company) {
       res.status(404).json({ error: "Company not found" });
       return;
@@ -216,7 +251,9 @@ export function costRoutes(
   router.get("/companies/:companyId/budgets/overview", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    const overview = await budgets.overview(companyId);
+    const overview = await withCompanyRls(db, companyId, (scopedDb) =>
+      scopedServices(scopedDb).budgets.overview(companyId),
+    );
     res.json(overview);
   });
 
@@ -227,7 +264,9 @@ export function costRoutes(
       assertBoard(req);
       const companyId = req.params.companyId as string;
       assertCompanyAccess(req, companyId);
-      const summary = await budgets.upsertPolicy(companyId, req.body, req.actor.userId ?? "board");
+      const summary = await withCompanyRls(db, companyId, (scopedDb) =>
+        scopedServices(scopedDb).budgets.upsertPolicy(companyId, req.body, req.actor.userId ?? "board"),
+      );
       res.json(summary);
     },
   );
@@ -240,7 +279,9 @@ export function costRoutes(
       const companyId = req.params.companyId as string;
       const incidentId = req.params.incidentId as string;
       assertCompanyAccess(req, companyId);
-      const incident = await budgets.resolveIncident(companyId, incidentId, req.body, req.actor.userId ?? "board");
+      const incident = await withCompanyRls(db, companyId, (scopedDb) =>
+        scopedServices(scopedDb).budgets.resolveIncident(companyId, incidentId, req.body, req.actor.userId ?? "board"),
+      );
       res.json(incident);
     },
   );
@@ -249,7 +290,9 @@ export function costRoutes(
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const range = parseCostDateRange(req.query);
-    const rows = await costs.byProject(companyId, range);
+    const rows = await withCompanyRls(db, companyId, (scopedDb) =>
+      scopedServices(scopedDb).costs.byProject(companyId, range),
+    );
     res.json(rows);
   });
 
@@ -257,39 +300,46 @@ export function costRoutes(
     assertBoard(req);
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    const company = await companies.update(companyId, { budgetMonthlyCents: req.body.budgetMonthlyCents });
+    const company = await withCompanyRls(db, companyId, async (scopedDb) => {
+      const { companies, budgets } = scopedServices(scopedDb);
+      const updated = await companies.update(companyId, { budgetMonthlyCents: req.body.budgetMonthlyCents });
+      if (!updated) {
+        return null;
+      }
+
+      await logActivity(scopedDb, {
+        companyId,
+        actorType: "user",
+        actorId: req.actor.userId ?? "board",
+        action: "company.budget_updated",
+        entityType: "company",
+        entityId: companyId,
+        details: { budgetMonthlyCents: req.body.budgetMonthlyCents },
+      });
+
+      await budgets.upsertPolicy(
+        companyId,
+        {
+          scopeType: "company",
+          scopeId: companyId,
+          amount: req.body.budgetMonthlyCents,
+          windowKind: "calendar_month_utc",
+        },
+        req.actor.userId ?? "board",
+      );
+      return updated;
+    });
     if (!company) {
       res.status(404).json({ error: "Company not found" });
       return;
     }
-
-    await logActivity(db, {
-      companyId,
-      actorType: "user",
-      actorId: req.actor.userId ?? "board",
-      action: "company.budget_updated",
-      entityType: "company",
-      entityId: companyId,
-      details: { budgetMonthlyCents: req.body.budgetMonthlyCents },
-    });
-
-    await budgets.upsertPolicy(
-      companyId,
-      {
-        scopeType: "company",
-        scopeId: companyId,
-        amount: req.body.budgetMonthlyCents,
-        windowKind: "calendar_month_utc",
-      },
-      req.actor.userId ?? "board",
-    );
 
     res.json(company);
   });
 
   router.patch("/agents/:agentId/budgets", validate(updateBudgetSchema), async (req, res) => {
     const agentId = req.params.agentId as string;
-    const agent = await agents.getById(agentId);
+    const agent = await rootAgents.getById(agentId);
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
       return;
@@ -298,34 +348,42 @@ export function costRoutes(
     assertCompanyAccess(req, agent.companyId);
     assertBoard(req);
 
-    const updated = await agents.update(agentId, { budgetMonthlyCents: req.body.budgetMonthlyCents });
+    const updated = await withCompanyRls(db, agent.companyId, async (scopedDb) => {
+      const { agents, budgets } = scopedServices(scopedDb);
+      const next = await agents.update(agentId, { budgetMonthlyCents: req.body.budgetMonthlyCents });
+      if (!next) {
+        return null;
+      }
+
+      const actor = getActorInfo(req);
+      await logActivity(scopedDb, {
+        companyId: next.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        action: "agent.budget_updated",
+        entityType: "agent",
+        entityId: next.id,
+        details: { budgetMonthlyCents: next.budgetMonthlyCents },
+      });
+
+      await budgets.upsertPolicy(
+        next.companyId,
+        {
+          scopeType: "agent",
+          scopeId: next.id,
+          amount: next.budgetMonthlyCents,
+          windowKind: "calendar_month_utc",
+        },
+        req.actor.type === "board" ? req.actor.userId ?? "board" : null,
+      );
+
+      return next;
+    });
     if (!updated) {
       res.status(404).json({ error: "Agent not found" });
       return;
     }
-
-    const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: updated.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      action: "agent.budget_updated",
-      entityType: "agent",
-      entityId: updated.id,
-      details: { budgetMonthlyCents: updated.budgetMonthlyCents },
-    });
-
-    await budgets.upsertPolicy(
-      updated.companyId,
-      {
-        scopeType: "agent",
-        scopeId: updated.id,
-        amount: updated.budgetMonthlyCents,
-        windowKind: "calendar_month_utc",
-      },
-      req.actor.type === "board" ? req.actor.userId ?? "board" : null,
-    );
 
     res.json(updated);
   });

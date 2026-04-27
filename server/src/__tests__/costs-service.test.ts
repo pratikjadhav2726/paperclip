@@ -50,6 +50,11 @@ const mockHeartbeatService = vi.hoisted(() => ({
 }));
 const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockFetchAllQuotaWindows = vi.hoisted(() => vi.fn());
+const mockWithCompanyRls = vi.hoisted(() =>
+  vi.fn(async (_db: unknown, _companyId: string, operation: (scopedDb: unknown) => Promise<unknown>) =>
+    operation({ scoped: true }),
+  ),
+);
 const mockCostService = vi.hoisted(() => ({
   createEvent: vi.fn(),
   summary: vi.fn().mockResolvedValue({ spendCents: 0 }),
@@ -81,6 +86,9 @@ const mockBudgetService = vi.hoisted(() => ({
 }));
 
 function registerModuleMocks() {
+  vi.doMock("../services/company-rls.js", () => ({
+    withCompanyRls: mockWithCompanyRls,
+  }));
   vi.doMock("../services/index.js", () => ({
     budgetService: () => mockBudgetService,
     costService: () => mockCostService,
@@ -136,11 +144,13 @@ async function loadCostParsers() {
 beforeEach(() => {
   vi.resetModules();
   vi.doUnmock("../services/index.js");
+  vi.doUnmock("../services/company-rls.js");
   vi.doUnmock("../services/quota-windows.js");
   vi.doUnmock("../routes/costs.js");
   vi.doUnmock("../middleware/index.js");
   registerModuleMocks();
   vi.clearAllMocks();
+  mockWithCompanyRls.mockClear();
   mockCompanyService.update.mockResolvedValue({
     id: "company-1",
     name: "Paperclip",
@@ -192,6 +202,7 @@ describe("cost routes", () => {
       .get("/api/companies/company-1/costs/finance-summary")
       .query({ from: "2026-02-01T00:00:00.000Z", to: "2026-02-28T23:59:59.999Z" });
     expect(res.status).toBe(200);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), "company-1", expect.any(Function));
     expect(res.body).toEqual({
       debitCents: 0,
       creditCents: 0,
@@ -225,6 +236,7 @@ describe("cost routes", () => {
       .send({ budgetMonthlyCents: 2500 });
 
     expect(res.status).toBe(403);
+    expect(mockWithCompanyRls).not.toHaveBeenCalled();
     expect(mockCompanyService.update).not.toHaveBeenCalled();
   });
 
