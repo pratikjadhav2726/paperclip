@@ -28,6 +28,8 @@ import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
+import { configureLiveEventFanout } from "./services/live-events.js";
+import { createPostgresLiveEventFanout } from "./services/live-events-postgres.js";
 import { createSchedulerLeaseRunner, type SchedulerLeaseResult } from "./services/scheduler-lease.js";
 import {
   feedbackService,
@@ -651,6 +653,32 @@ export async function startServer(): Promise<StartedServer> {
   process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON = JSON.stringify(runtimeApiCandidates);
   process.env.PAPERCLIP_API_URL = configuredApiUrl;
   
+  if (config.databaseUrl) {
+    void createPostgresLiveEventFanout({
+      databaseUrl: config.databaseUrl,
+      onError: (err) => {
+        logger.warn({ err }, "postgres live-events fanout listener failed");
+      },
+    })
+      .then((transport) => {
+        const cleanupLiveEventFanout = configureLiveEventFanout({
+          transport,
+          onError: (err, event) => {
+            logger.warn({ err, eventType: event.type, companyId: event.companyId }, "postgres live-events fanout publish failed");
+          },
+        });
+        server.on("close", () => {
+          void cleanupLiveEventFanout().catch((err) => {
+            logger.warn({ err }, "postgres live-events fanout cleanup failed");
+          });
+        });
+        logger.info("Postgres live-events fanout enabled");
+      })
+      .catch((err) => {
+        logger.warn({ err }, "Postgres live-events fanout disabled after setup failure");
+      });
+  }
+
   setupLiveEventsWebSocketServer(server, db as any, {
     deploymentMode: config.deploymentMode,
     resolveSessionFromHeaders,

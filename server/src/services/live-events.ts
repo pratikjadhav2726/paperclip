@@ -3,11 +3,19 @@ import type { LiveEvent, LiveEventType } from "@paperclipai/shared";
 
 type LiveEventPayload = Record<string, unknown>;
 type LiveEventListener = (event: LiveEvent) => void;
+type LiveEventFanoutErrorHandler = (error: unknown, event: LiveEvent) => void;
+
+export interface LiveEventFanoutTransport {
+  publish(event: LiveEvent): Promise<void>;
+  close?(): Promise<void>;
+}
 
 const emitter = new EventEmitter();
 emitter.setMaxListeners(0);
 
 let nextEventId = 0;
+let fanoutTransport: LiveEventFanoutTransport | null = null;
+let fanoutErrorHandler: LiveEventFanoutErrorHandler | null = null;
 
 function toLiveEvent(input: {
   companyId: string;
@@ -24,13 +32,45 @@ function toLiveEvent(input: {
   };
 }
 
+function emitLiveEvent(event: LiveEvent) {
+  emitter.emit(event.companyId, event);
+}
+
+function publishToFanout(event: LiveEvent) {
+  if (!fanoutTransport) return;
+  void fanoutTransport.publish(event).catch((error) => {
+    fanoutErrorHandler?.(error, event);
+  });
+}
+
+export function configureLiveEventFanout(input: {
+  transport: LiveEventFanoutTransport;
+  onError?: LiveEventFanoutErrorHandler;
+}) {
+  fanoutTransport = input.transport;
+  fanoutErrorHandler = input.onError ?? null;
+
+  return async () => {
+    if (fanoutTransport === input.transport) {
+      fanoutTransport = null;
+      fanoutErrorHandler = null;
+    }
+    await input.transport.close?.();
+  };
+}
+
+export function receiveRemoteLiveEvent(event: LiveEvent) {
+  emitLiveEvent(event);
+}
+
 export function publishLiveEvent(input: {
   companyId: string;
   type: LiveEventType;
   payload?: LiveEventPayload;
 }) {
   const event = toLiveEvent(input);
-  emitter.emit(input.companyId, event);
+  emitLiveEvent(event);
+  publishToFanout(event);
   return event;
 }
 
@@ -39,7 +79,8 @@ export function publishGlobalLiveEvent(input: {
   payload?: LiveEventPayload;
 }) {
   const event = toLiveEvent({ companyId: "*", type: input.type, payload: input.payload });
-  emitter.emit("*", event);
+  emitLiveEvent(event);
+  publishToFanout(event);
   return event;
 }
 
