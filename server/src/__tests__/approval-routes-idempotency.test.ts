@@ -148,6 +148,7 @@ describe("approval routes idempotent retries", () => {
       .send({});
 
     expect(res.status).toBe(200);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), "company-1", expect.any(Function));
     expect(mockIssueApprovalService.listIssuesForApproval).not.toHaveBeenCalled();
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
     expect(mockLogActivity).not.toHaveBeenCalled();
@@ -194,6 +195,7 @@ describe("approval routes idempotent retries", () => {
       .send({});
 
     expect(res.status).toBe(403);
+    expect(mockWithCompanyRls).not.toHaveBeenCalled();
     expect(mockApprovalService.approve).not.toHaveBeenCalled();
   });
 

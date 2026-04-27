@@ -30,6 +30,11 @@ const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockGetTelemetryClient = vi.hoisted(() => vi.fn());
 const mockAssertCanManageProjectWorkspaceRuntimeServices = vi.hoisted(() => vi.fn());
 const mockAssertCanManageExecutionWorkspaceRuntimeServices = vi.hoisted(() => vi.fn());
+const mockWithCompanyRls = vi.hoisted(() =>
+  vi.fn(async (_db: unknown, _companyId: string, operation: (scopedDb: unknown) => Promise<unknown>) =>
+    operation({ scoped: true }),
+  ),
+);
 
 vi.mock("../telemetry.js", () => ({
   getTelemetryClient: mockGetTelemetryClient,
@@ -54,6 +59,9 @@ vi.mock("../services/workspace-runtime.js", () => ({
 vi.mock("../routes/workspace-runtime-service-authz.js", () => ({
   assertCanManageProjectWorkspaceRuntimeServices: mockAssertCanManageProjectWorkspaceRuntimeServices,
   assertCanManageExecutionWorkspaceRuntimeServices: mockAssertCanManageExecutionWorkspaceRuntimeServices,
+}));
+vi.mock("../services/company-rls.js", () => ({
+  withCompanyRls: mockWithCompanyRls,
 }));
 
 function registerWorkspaceRouteMocks() {
@@ -80,6 +88,9 @@ function registerWorkspaceRouteMocks() {
   vi.doMock("../routes/workspace-runtime-service-authz.js", () => ({
     assertCanManageProjectWorkspaceRuntimeServices: mockAssertCanManageProjectWorkspaceRuntimeServices,
     assertCanManageExecutionWorkspaceRuntimeServices: mockAssertCanManageExecutionWorkspaceRuntimeServices,
+  }));
+  vi.doMock("../services/company-rls.js", () => ({
+    withCompanyRls: mockWithCompanyRls,
   }));
 }
 
@@ -192,6 +203,7 @@ describe.sequential("workspace runtime service route authorization", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockWithCompanyRls.mockClear();
     mockEnvironmentService.getById.mockResolvedValue(null);
     mockSecretService.normalizeEnvBindingsForPersistence.mockImplementation(async (_companyId, env) => env);
     mockProjectService.resolveByReference.mockResolvedValue({ ambiguous: false, project: null });
@@ -316,6 +328,7 @@ describe.sequential("workspace runtime service route authorization", () => {
 
     expect(res.status).toBe(403);
     expect(res.body.error).toContain("Missing permission");
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), "company-1", expect.any(Function));
     expect(mockProjectService.getById).toHaveBeenCalledWith(projectId);
     expect(mockAssertCanManageProjectWorkspaceRuntimeServices).toHaveBeenCalled();
   }, 15000);

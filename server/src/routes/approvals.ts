@@ -34,11 +34,9 @@ export function approvalRoutes(
 ) {
   const router = Router();
   const svc = approvalService(db);
-  const heartbeat = heartbeatService(db, {
+  const rootHeartbeat = heartbeatService(db, {
     pluginWorkerManager: options.pluginWorkerManager,
   });
-  const issueApprovalsSvc = issueApprovalService(db);
-  const secretsSvc = secretService(db);
   const strictSecretsMode = process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true";
 
   async function requireApprovalAccess(req: Request, id: string) {
@@ -136,42 +134,51 @@ export function approvalRoutes(
       return;
     }
     assertCompanyAccess(req, approval.companyId);
-    const issues = await issueApprovalsSvc.listIssuesForApproval(id);
+    const issues = await withCompanyRls(db, approval.companyId, (scopedDb) =>
+      issueApprovalService(scopedDb).listIssuesForApproval(id),
+    );
     res.json(issues);
   });
 
   router.post("/approvals/:id/approve", validate(resolveApprovalSchema), async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
-    if (!(await requireApprovalAccess(req, id))) {
+    const existing = await requireApprovalAccess(req, id);
+    if (!existing) {
       res.status(404).json({ error: "Approval not found" });
       return;
     }
     const decidedByUserId = req.actor.userId ?? "board";
-    const { approval, applied } = await svc.approve(id, decidedByUserId, req.body.decisionNote);
+    const { approval, applied } = await withCompanyRls(db, existing.companyId, (scopedDb) =>
+      approvalService(scopedDb).approve(id, decidedByUserId, req.body.decisionNote),
+    );
 
     if (applied) {
-      const linkedIssues = await issueApprovalsSvc.listIssuesForApproval(approval.id);
+      const linkedIssues = await withCompanyRls(db, approval.companyId, (scopedDb) =>
+        issueApprovalService(scopedDb).listIssuesForApproval(approval.id),
+      );
       const linkedIssueIds = linkedIssues.map((issue) => issue.id);
       const primaryIssueId = linkedIssueIds[0] ?? null;
 
-      await logActivity(db, {
-        companyId: approval.companyId,
-        actorType: "user",
-        actorId: req.actor.userId ?? "board",
-        action: "approval.approved",
-        entityType: "approval",
-        entityId: approval.id,
-        details: {
-          type: approval.type,
-          requestedByAgentId: approval.requestedByAgentId,
-          linkedIssueIds,
-        },
-      });
+      await withCompanyRls(db, approval.companyId, (scopedDb) =>
+        logActivity(scopedDb, {
+          companyId: approval.companyId,
+          actorType: "user",
+          actorId: req.actor.userId ?? "board",
+          action: "approval.approved",
+          entityType: "approval",
+          entityId: approval.id,
+          details: {
+            type: approval.type,
+            requestedByAgentId: approval.requestedByAgentId,
+            linkedIssueIds,
+          },
+        }),
+      );
 
       if (approval.requestedByAgentId) {
         try {
-          const wakeRun = await heartbeat.wakeup(approval.requestedByAgentId, {
+          const wakeRun = await rootHeartbeat.wakeup(approval.requestedByAgentId, {
             source: "automation",
             triggerDetail: "system",
             reason: "approval_approved",
@@ -194,19 +201,21 @@ export function approvalRoutes(
             },
           });
 
-          await logActivity(db, {
-            companyId: approval.companyId,
-            actorType: "user",
-            actorId: req.actor.userId ?? "board",
-            action: "approval.requester_wakeup_queued",
-            entityType: "approval",
-            entityId: approval.id,
-            details: {
-              requesterAgentId: approval.requestedByAgentId,
-              wakeRunId: wakeRun?.id ?? null,
-              linkedIssueIds,
-            },
-          });
+          await withCompanyRls(db, approval.companyId, (scopedDb) =>
+            logActivity(scopedDb, {
+              companyId: approval.companyId,
+              actorType: "user",
+              actorId: req.actor.userId ?? "board",
+              action: "approval.requester_wakeup_queued",
+              entityType: "approval",
+              entityId: approval.id,
+              details: {
+                requesterAgentId: approval.requestedByAgentId,
+                wakeRunId: wakeRun?.id ?? null,
+                linkedIssueIds,
+              },
+            }),
+          );
         } catch (err) {
           logger.warn(
             {
@@ -216,19 +225,21 @@ export function approvalRoutes(
             },
             "failed to queue requester wakeup after approval",
           );
-          await logActivity(db, {
-            companyId: approval.companyId,
-            actorType: "user",
-            actorId: req.actor.userId ?? "board",
-            action: "approval.requester_wakeup_failed",
-            entityType: "approval",
-            entityId: approval.id,
-            details: {
-              requesterAgentId: approval.requestedByAgentId,
-              linkedIssueIds,
-              error: err instanceof Error ? err.message : String(err),
-            },
-          });
+          await withCompanyRls(db, approval.companyId, (scopedDb) =>
+            logActivity(scopedDb, {
+              companyId: approval.companyId,
+              actorType: "user",
+              actorId: req.actor.userId ?? "board",
+              action: "approval.requester_wakeup_failed",
+              entityType: "approval",
+              entityId: approval.id,
+              details: {
+                requesterAgentId: approval.requestedByAgentId,
+                linkedIssueIds,
+                error: err instanceof Error ? err.message : String(err),
+              },
+            }),
+          );
         }
       }
     }
@@ -239,23 +250,28 @@ export function approvalRoutes(
   router.post("/approvals/:id/reject", validate(resolveApprovalSchema), async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
-    if (!(await requireApprovalAccess(req, id))) {
+    const existing = await requireApprovalAccess(req, id);
+    if (!existing) {
       res.status(404).json({ error: "Approval not found" });
       return;
     }
     const decidedByUserId = req.actor.userId ?? "board";
-    const { approval, applied } = await svc.reject(id, decidedByUserId, req.body.decisionNote);
+    const { approval, applied } = await withCompanyRls(db, existing.companyId, (scopedDb) =>
+      approvalService(scopedDb).reject(id, decidedByUserId, req.body.decisionNote),
+    );
 
     if (applied) {
-      await logActivity(db, {
-        companyId: approval.companyId,
-        actorType: "user",
-        actorId: req.actor.userId ?? "board",
-        action: "approval.rejected",
-        entityType: "approval",
-        entityId: approval.id,
-        details: { type: approval.type },
-      });
+      await withCompanyRls(db, approval.companyId, (scopedDb) =>
+        logActivity(scopedDb, {
+          companyId: approval.companyId,
+          actorType: "user",
+          actorId: req.actor.userId ?? "board",
+          action: "approval.rejected",
+          entityType: "approval",
+          entityId: approval.id,
+          details: { type: approval.type },
+        }),
+      );
     }
 
     res.json(redactApprovalPayload(approval));
@@ -267,22 +283,27 @@ export function approvalRoutes(
     async (req, res) => {
       assertBoard(req);
       const id = req.params.id as string;
-      if (!(await requireApprovalAccess(req, id))) {
+      const existing = await requireApprovalAccess(req, id);
+      if (!existing) {
         res.status(404).json({ error: "Approval not found" });
         return;
       }
       const decidedByUserId = req.actor.userId ?? "board";
-      const approval = await svc.requestRevision(id, decidedByUserId, req.body.decisionNote);
+      const approval = await withCompanyRls(db, existing.companyId, (scopedDb) =>
+        approvalService(scopedDb).requestRevision(id, decidedByUserId, req.body.decisionNote),
+      );
 
-      await logActivity(db, {
-        companyId: approval.companyId,
-        actorType: "user",
-        actorId: req.actor.userId ?? "board",
-        action: "approval.revision_requested",
-        entityType: "approval",
-        entityId: approval.id,
-        details: { type: approval.type },
-      });
+      await withCompanyRls(db, approval.companyId, (scopedDb) =>
+        logActivity(scopedDb, {
+          companyId: approval.companyId,
+          actorType: "user",
+          actorId: req.actor.userId ?? "board",
+          action: "approval.revision_requested",
+          entityType: "approval",
+          entityId: approval.id,
+          details: { type: approval.type },
+        }),
+      );
 
       res.json(redactApprovalPayload(approval));
     },
@@ -302,27 +323,32 @@ export function approvalRoutes(
       return;
     }
 
-    const normalizedPayload = req.body.payload
-      ? existing.type === "hire_agent"
-        ? await secretsSvc.normalizeHireApprovalPayloadForPersistence(
-            existing.companyId,
-            req.body.payload,
-            { strictMode: strictSecretsMode },
-          )
-        : req.body.payload
-      : undefined;
-    const approval = await svc.resubmit(id, normalizedPayload);
-    const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: approval.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      action: "approval.resubmitted",
-      entityType: "approval",
-      entityId: approval.id,
-      details: { type: approval.type },
+    const approval = await withCompanyRls(db, existing.companyId, async (scopedDb) => {
+      const scopedSecrets = secretService(scopedDb);
+      const normalizedPayload = req.body.payload
+        ? existing.type === "hire_agent"
+          ? await scopedSecrets.normalizeHireApprovalPayloadForPersistence(
+              existing.companyId,
+              req.body.payload,
+              { strictMode: strictSecretsMode },
+            )
+          : req.body.payload
+        : undefined;
+      return approvalService(scopedDb).resubmit(id, normalizedPayload);
     });
+    const actor = getActorInfo(req);
+    await withCompanyRls(db, approval.companyId, (scopedDb) =>
+      logActivity(scopedDb, {
+        companyId: approval.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        action: "approval.resubmitted",
+        entityType: "approval",
+        entityId: approval.id,
+        details: { type: approval.type },
+      }),
+    );
     res.json(redactApprovalPayload(approval));
   });
 
@@ -334,7 +360,9 @@ export function approvalRoutes(
       return;
     }
     assertCompanyAccess(req, approval.companyId);
-    const comments = await svc.listComments(id);
+    const comments = await withCompanyRls(db, approval.companyId, (scopedDb) =>
+      approvalService(scopedDb).listComments(id),
+    );
     res.json(comments);
   });
 
@@ -347,20 +375,22 @@ export function approvalRoutes(
     }
     assertCompanyAccess(req, approval.companyId);
     const actor = getActorInfo(req);
-    const comment = await svc.addComment(id, req.body.body, {
-      agentId: actor.agentId ?? undefined,
-      userId: actor.actorType === "user" ? actor.actorId : undefined,
-    });
-
-    await logActivity(db, {
-      companyId: approval.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      action: "approval.comment_added",
-      entityType: "approval",
-      entityId: approval.id,
-      details: { commentId: comment.id },
+    const comment = await withCompanyRls(db, approval.companyId, async (scopedDb) => {
+      const created = await approvalService(scopedDb).addComment(id, req.body.body, {
+        agentId: actor.agentId ?? undefined,
+        userId: actor.actorType === "user" ? actor.actorId : undefined,
+      });
+      await logActivity(scopedDb, {
+        companyId: approval.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        action: "approval.comment_added",
+        entityType: "approval",
+        entityId: approval.id,
+        details: { commentId: created.id },
+      });
+      return created;
     });
 
     res.status(201).json(comment);

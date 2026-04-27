@@ -23,6 +23,11 @@ const mockEnvironmentService = vi.hoisted(() => ({
 const mockWorkspaceOperationService = vi.hoisted(() => ({}));
 const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockGetTelemetryClient = vi.hoisted(() => vi.fn());
+const mockWithCompanyRls = vi.hoisted(() =>
+  vi.fn(async (_db: unknown, _companyId: string, operation: (scopedDb: unknown) => Promise<unknown>) =>
+    operation({ scoped: true }),
+  ),
+);
 
 vi.mock("../telemetry.js", () => ({
   getTelemetryClient: mockGetTelemetryClient,
@@ -50,6 +55,9 @@ vi.mock("../services/workspace-runtime.js", () => ({
 }));
 
 function registerModuleMocks() {
+  vi.doMock("../services/company-rls.js", () => ({
+    withCompanyRls: mockWithCompanyRls,
+  }));
   vi.doMock("../telemetry.js", () => ({
     getTelemetryClient: mockGetTelemetryClient,
   }));
@@ -91,6 +99,22 @@ async function createApp() {
       source: "local_implicit",
       isInstanceAdmin: false,
     };
+    next();
+  });
+  app.use("/api", projectRoutes({} as any));
+  app.use(errorHandler);
+  return app;
+}
+
+async function createAppWithActor(actor: Record<string, unknown>) {
+  const [{ projectRoutes }, { errorHandler }] = await Promise.all([
+    vi.importActual<typeof import("../routes/projects.js")>("../routes/projects.js"),
+    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
+  ]);
+  const app = express();
+  app.use(express.json());
+  app.use((req, _res, next) => {
+    (req as any).actor = actor;
     next();
   });
   app.use("/api", projectRoutes({} as any));
@@ -140,12 +164,14 @@ describe("project env routes", () => {
   beforeEach(() => {
     vi.resetModules();
     vi.doUnmock("../routes/projects.js");
+    vi.doUnmock("../services/company-rls.js");
     vi.doUnmock("../routes/authz.js");
     vi.doUnmock("../middleware/index.js");
     vi.doUnmock("../services/environments.js");
     vi.doUnmock("../services/secrets.js");
     registerModuleMocks();
     vi.clearAllMocks();
+    mockWithCompanyRls.mockClear();
     mockGetTelemetryClient.mockReturnValue({ track: vi.fn() });
     mockProjectService.resolveByReference.mockResolvedValue({ ambiguous: false, project: null });
     mockProjectService.createWorkspace.mockResolvedValue(null);
@@ -174,6 +200,7 @@ describe("project env routes", () => {
       });
 
     expect([200, 201], JSON.stringify(res.body)).toContain(res.status);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), "company-1", expect.any(Function));
     expect(mockSecretService.normalizeEnvBindingsForPersistence).toHaveBeenCalledWith(
       "company-1",
       normalizedEnv,
@@ -209,6 +236,7 @@ describe("project env routes", () => {
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), "company-1", expect.any(Function));
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
@@ -218,5 +246,22 @@ describe("project env routes", () => {
         },
       }),
     );
+  });
+
+  it("checks company access before entering RLS scope for project create", async () => {
+    const app = await createAppWithActor({
+      type: "board",
+      userId: "board-user",
+      companyIds: ["company-2"],
+      source: "session",
+      isInstanceAdmin: false,
+    });
+    const res = await request(app)
+      .post("/api/companies/company-1/projects")
+      .send({ name: "Project" });
+
+    expect(res.status).toBe(403);
+    expect(mockWithCompanyRls).not.toHaveBeenCalled();
+    expect(mockProjectService.create).not.toHaveBeenCalled();
   });
 });

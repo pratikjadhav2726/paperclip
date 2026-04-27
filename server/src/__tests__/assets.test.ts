@@ -9,8 +9,16 @@ const { createAssetMock, getAssetByIdMock, logActivityMock } = vi.hoisted(() => 
   getAssetByIdMock: vi.fn(),
   logActivityMock: vi.fn(),
 }));
+const mockWithCompanyRls = vi.hoisted(() =>
+  vi.fn(async (_db: unknown, _companyId: string, operation: (scopedDb: unknown) => Promise<unknown>) =>
+    operation({ scoped: true }),
+  ),
+);
 
 function registerModuleMocks() {
+  vi.doMock("../services/company-rls.js", () => ({
+    withCompanyRls: mockWithCompanyRls,
+  }));
   vi.doMock("../services/activity-log.js", () => ({
     logActivity: logActivityMock,
   }));
@@ -144,6 +152,7 @@ describe("POST /api/companies/:companyId/assets/images", () => {
     vi.doUnmock("../middleware/index.js");
     registerModuleMocks();
     vi.clearAllMocks();
+    mockWithCompanyRls.mockClear();
     createAssetMock.mockReset();
     getAssetByIdMock.mockReset();
     logActivityMock.mockReset();
@@ -163,6 +172,7 @@ describe("POST /api/companies/:companyId/assets/images", () => {
     );
 
     expect([200, 201], JSON.stringify(res.body)).toContain(res.status);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), "company-1", expect.any(Function));
     expect(res.body.contentPath).toBe("/api/assets/asset-1/content");
     expect(createAssetMock).toHaveBeenCalledTimes(1);
     expect(png.__calls.putFileInputs[0]).toMatchObject({
@@ -206,6 +216,7 @@ describe("POST /api/companies/:companyId/logo", () => {
     vi.doUnmock("../middleware/index.js");
     registerModuleMocks();
     vi.clearAllMocks();
+    mockWithCompanyRls.mockClear();
     createAssetMock.mockReset();
     getAssetByIdMock.mockReset();
     logActivityMock.mockReset();
@@ -224,6 +235,7 @@ describe("POST /api/companies/:companyId/logo", () => {
     );
 
     expect(res.status, JSON.stringify({ body: res.body, text: res.text, createCalls: createAssetMock.mock.calls.length })).toBe(201);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), "company-1", expect.any(Function));
     expect(res.body.contentPath).toBe("/api/assets/asset-1/content");
     expect(createAssetMock).toHaveBeenCalledTimes(1);
     expect(png.__calls.putFileInputs[0]).toMatchObject({

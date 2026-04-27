@@ -8,6 +8,7 @@ import type { StorageService } from "../storage/types.js";
 import { assetService, logActivity } from "../services/index.js";
 import { isAllowedContentType, MAX_ATTACHMENT_BYTES } from "../attachment-types.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
+import { withCompanyRls } from "../services/company-rls.js";
 const SVG_CONTENT_TYPE = "image/svg+xml";
 const ALLOWED_COMPANY_LOGO_CONTENT_TYPES = new Set([
   "image/png",
@@ -84,7 +85,6 @@ function sanitizeSvgBuffer(input: Buffer): Buffer | null {
 
 export function assetRoutes(db: Db, storage: StorageService) {
   const router = Router();
-  const svc = assetService(db);
   const assetUpload = multer({
     storage: multer.memoryStorage(),
     limits: { fileSize: MAX_ATTACHMENT_BYTES, files: 1 },
@@ -166,31 +166,34 @@ export function assetRoutes(db: Db, storage: StorageService) {
       body: fileBody,
     });
 
-    const asset = await svc.create(companyId, {
-      provider: stored.provider,
-      objectKey: stored.objectKey,
-      contentType: stored.contentType,
-      byteSize: stored.byteSize,
-      sha256: stored.sha256,
-      originalFilename: stored.originalFilename,
-      createdByAgentId: actor.agentId,
-      createdByUserId: actor.actorType === "user" ? actor.actorId : null,
-    });
+    const asset = await withCompanyRls(db, companyId, async (scopedDb) => {
+      const created = await assetService(scopedDb).create(companyId, {
+        provider: stored.provider,
+        objectKey: stored.objectKey,
+        contentType: stored.contentType,
+        byteSize: stored.byteSize,
+        sha256: stored.sha256,
+        originalFilename: stored.originalFilename,
+        createdByAgentId: actor.agentId,
+        createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+      });
 
-    await logActivity(db, {
-      companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "asset.created",
-      entityType: "asset",
-      entityId: asset.id,
-      details: {
-        originalFilename: asset.originalFilename,
-        contentType: asset.contentType,
-        byteSize: asset.byteSize,
-      },
+      await logActivity(scopedDb, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "asset.created",
+        entityType: "asset",
+        entityId: created.id,
+        details: {
+          originalFilename: created.originalFilename,
+          contentType: created.contentType,
+          byteSize: created.byteSize,
+        },
+      });
+      return created;
     });
 
     res.status(201).json({
@@ -264,32 +267,35 @@ export function assetRoutes(db: Db, storage: StorageService) {
       body: fileBody,
     });
 
-    const asset = await svc.create(companyId, {
-      provider: stored.provider,
-      objectKey: stored.objectKey,
-      contentType: stored.contentType,
-      byteSize: stored.byteSize,
-      sha256: stored.sha256,
-      originalFilename: stored.originalFilename,
-      createdByAgentId: actor.agentId,
-      createdByUserId: actor.actorType === "user" ? actor.actorId : null,
-    });
+    const asset = await withCompanyRls(db, companyId, async (scopedDb) => {
+      const created = await assetService(scopedDb).create(companyId, {
+        provider: stored.provider,
+        objectKey: stored.objectKey,
+        contentType: stored.contentType,
+        byteSize: stored.byteSize,
+        sha256: stored.sha256,
+        originalFilename: stored.originalFilename,
+        createdByAgentId: actor.agentId,
+        createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+      });
 
-    await logActivity(db, {
-      companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "asset.created",
-      entityType: "asset",
-      entityId: asset.id,
-      details: {
-        originalFilename: asset.originalFilename,
-        contentType: asset.contentType,
-        byteSize: asset.byteSize,
-        namespace: "assets/companies",
-      },
+      await logActivity(scopedDb, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "asset.created",
+        entityType: "asset",
+        entityId: created.id,
+        details: {
+          originalFilename: created.originalFilename,
+          contentType: created.contentType,
+          byteSize: created.byteSize,
+          namespace: "assets/companies",
+        },
+      });
+      return created;
     });
 
     res.status(201).json({
@@ -311,14 +317,16 @@ export function assetRoutes(db: Db, storage: StorageService) {
 
   router.get("/assets/:assetId/content", async (req, res, next) => {
     const assetId = req.params.assetId as string;
-    const asset = await svc.getById(assetId);
+    const asset = await assetService(db).getById(assetId);
     if (!asset) {
       res.status(404).json({ error: "Asset not found" });
       return;
     }
     assertCompanyAccess(req, asset.companyId);
 
-    const object = await storage.getObject(asset.companyId, asset.objectKey);
+    const object = await withCompanyRls(db, asset.companyId, () =>
+      storage.getObject(asset.companyId, asset.objectKey),
+    );
     const responseContentType = asset.contentType || object.contentType || "application/octet-stream";
     res.setHeader("Content-Type", responseContentType);
     res.setHeader("Content-Length", String(asset.byteSize || object.contentLength || 0));
