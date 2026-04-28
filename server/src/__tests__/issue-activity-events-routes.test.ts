@@ -637,7 +637,7 @@ describe("issue activity event routes", () => {
     const issue = makeIssue();
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueApprovalService.listApprovalsForIssue.mockResolvedValue([
-      { id: "approval-1", issueId: issue.id },
+      { id: "11111111-2222-4333-8444-555555555555", issueId: issue.id },
     ]);
     const app = await createApp();
 
@@ -648,19 +648,24 @@ describe("issue activity event routes", () => {
 
     const linkRes = await request(app)
       .post(`/api/issues/${issue.id}/approvals`)
-      .send({ approvalId: "approval-1" });
+      .send({ approvalId: "11111111-2222-4333-8444-555555555555" });
     expect(linkRes.status).toBe(201);
     expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), "company-1", expect.any(Function));
     expect(mockIssueApprovalService.link).toHaveBeenCalledWith(
       issue.id,
-      "approval-1",
+      "11111111-2222-4333-8444-555555555555",
       expect.objectContaining({ userId: "local-board" }),
     );
 
-    const unlinkRes = await request(app).delete(`/api/issues/${issue.id}/approvals/approval-1`);
+    const unlinkRes = await request(app).delete(
+      `/api/issues/${issue.id}/approvals/11111111-2222-4333-8444-555555555555`,
+    );
     expect(unlinkRes.status).toBe(200);
     expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), "company-1", expect.any(Function));
-    expect(mockIssueApprovalService.unlink).toHaveBeenCalledWith(issue.id, "approval-1");
+    expect(mockIssueApprovalService.unlink).toHaveBeenCalledWith(
+      issue.id,
+      "11111111-2222-4333-8444-555555555555",
+    );
   });
 
   it("checks access before entering RLS scope for issue approvals list", async () => {

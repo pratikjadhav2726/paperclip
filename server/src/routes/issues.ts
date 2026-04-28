@@ -1542,26 +1542,31 @@ export function issueRoutes(
     }
     assertCompanyAccess(req, issue.companyId);
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
-    const product = await workProductsSvc.createForIssue(issue.id, issue.companyId, {
-      ...req.body,
-      projectId: req.body.projectId ?? issue.projectId ?? null,
+    const actor = getActorInfo(req);
+    const product = await withCompanyRls(db, issue.companyId, async (scopedDb) => {
+      const scopedWorkProductsService = workProductService(scopedDb);
+      const created = await scopedWorkProductsService.createForIssue(issue.id, issue.companyId, {
+        ...req.body,
+        projectId: req.body.projectId ?? issue.projectId ?? null,
+      });
+      if (!created) return null;
+      await logActivity(scopedDb, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.work_product_created",
+        entityType: "issue",
+        entityId: issue.id,
+        details: { workProductId: created.id, type: created.type, provider: created.provider },
+      });
+      return created;
     });
     if (!product) {
       res.status(422).json({ error: "Invalid work product payload" });
       return;
     }
-    const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: issue.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "issue.work_product_created",
-      entityType: "issue",
-      entityId: issue.id,
-      details: { workProductId: product.id, type: product.type, provider: product.provider },
-    });
     res.status(201).json(product);
   });
 
@@ -1579,23 +1584,28 @@ export function issueRoutes(
       return;
     }
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
-    const product = await workProductsSvc.update(id, req.body);
+    const actor = getActorInfo(req);
+    const product = await withCompanyRls(db, existing.companyId, async (scopedDb) => {
+      const scopedWorkProductsService = workProductService(scopedDb);
+      const updated = await scopedWorkProductsService.update(id, req.body);
+      if (!updated) return null;
+      await logActivity(scopedDb, {
+        companyId: existing.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.work_product_updated",
+        entityType: "issue",
+        entityId: existing.issueId,
+        details: { workProductId: updated.id, changedKeys: Object.keys(req.body).sort() },
+      });
+      return updated;
+    });
     if (!product) {
       res.status(404).json({ error: "Work product not found" });
       return;
     }
-    const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: existing.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "issue.work_product_updated",
-      entityType: "issue",
-      entityId: existing.issueId,
-      details: { workProductId: product.id, changedKeys: Object.keys(req.body).sort() },
-    });
     res.json(product);
   });
 
@@ -1613,23 +1623,28 @@ export function issueRoutes(
       return;
     }
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
-    const removed = await workProductsSvc.remove(id);
+    const actor = getActorInfo(req);
+    const removed = await withCompanyRls(db, existing.companyId, async (scopedDb) => {
+      const scopedWorkProductsService = workProductService(scopedDb);
+      const deleted = await scopedWorkProductsService.remove(id);
+      if (!deleted) return null;
+      await logActivity(scopedDb, {
+        companyId: existing.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.work_product_deleted",
+        entityType: "issue",
+        entityId: existing.issueId,
+        details: { workProductId: deleted.id, type: deleted.type },
+      });
+      return deleted;
+    });
     if (!removed) {
       res.status(404).json({ error: "Work product not found" });
       return;
     }
-    const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: existing.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "issue.work_product_deleted",
-      entityType: "issue",
-      entityId: existing.issueId,
-      details: { workProductId: removed.id, type: removed.type },
-    });
     res.json(removed);
   });
 
