@@ -462,9 +462,9 @@ export function issueRoutes(
     interactions: Array<{ id: string; kind: string; status: string; result?: unknown }>;
     actor: ReturnType<typeof getActorInfo>;
     source: string;
-  }) {
+  }, activityDb: Db = db) {
     for (const interaction of input.interactions) {
-      await logActivity(db, {
+      await logActivity(activityDb, {
         companyId: input.issue.companyId,
         actorType: input.actor.actorType,
         actorId: input.actor.actorId,
@@ -1298,70 +1298,78 @@ export function issueRoutes(
     }
 
     const actor = getActorInfo(req);
-    const referenceSummaryBefore = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
-    const result = await documentsSvc.upsertIssueDocument({
-      issueId: issue.id,
-      key: keyParsed.data,
-      title: req.body.title ?? null,
-      format: req.body.format,
-      body: req.body.body,
-      changeSummary: req.body.changeSummary ?? null,
-      baseRevisionId: req.body.baseRevisionId ?? null,
-      createdByAgentId: actor.agentId ?? null,
-      createdByUserId: actor.actorType === "user" ? actor.actorId : null,
-      createdByRunId: actor.runId ?? null,
-    });
-    const doc = result.document;
-    await issueReferencesSvc.syncDocument(doc.id);
-    const referenceSummaryAfter = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
-    const referenceDiff = issueReferencesSvc.diffIssueReferenceSummary(referenceSummaryBefore, referenceSummaryAfter);
+    const result = await withCompanyRls(db, issue.companyId, async (scopedDb) => {
+      const scopedIssueReferencesService = issueReferenceService(scopedDb);
+      const scopedDocumentsService = documentService(scopedDb);
+      const scopedIssueThreadInteractionService = issueThreadInteractionService(scopedDb);
 
-    await logActivity(db, {
-      companyId: issue.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: result.created ? "issue.document_created" : "issue.document_updated",
-      entityType: "issue",
-      entityId: issue.id,
-      details: {
-        key: doc.key,
-        documentId: doc.id,
-        title: doc.title,
-        format: doc.format,
-        revisionNumber: doc.latestRevisionNumber,
-        ...summarizeIssueReferenceActivityDetails({
-          addedReferencedIssues: referenceDiff.addedReferencedIssues.map(summarizeIssueRelationForActivity),
-          removedReferencedIssues: referenceDiff.removedReferencedIssues.map(summarizeIssueRelationForActivity),
-          currentReferencedIssues: referenceDiff.currentReferencedIssues.map(summarizeIssueRelationForActivity),
-        }),
-      },
-    });
-
-    if (!result.created) {
-      const expiredInteractions = await issueThreadInteractionService(db).expireStaleRequestConfirmationsForIssueDocument(
-        issue,
-        {
-          id: doc.id,
-          key: doc.key,
-          latestRevisionId: doc.latestRevisionId,
-          latestRevisionNumber: doc.latestRevisionNumber,
-        },
-        {
-          agentId: actor.agentId,
-          userId: actor.actorType === "user" ? actor.actorId : null,
-        },
-      );
-      await logExpiredRequestConfirmations({
-        issue,
-        interactions: expiredInteractions,
-        actor,
-        source: "issue.document_updated",
+      const referenceSummaryBefore = await scopedIssueReferencesService.listIssueReferenceSummary(issue.id);
+      const upsertResult = await scopedDocumentsService.upsertIssueDocument({
+        issueId: issue.id,
+        key: keyParsed.data,
+        title: req.body.title ?? null,
+        format: req.body.format,
+        body: req.body.body,
+        changeSummary: req.body.changeSummary ?? null,
+        baseRevisionId: req.body.baseRevisionId ?? null,
+        createdByAgentId: actor.agentId ?? null,
+        createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+        createdByRunId: actor.runId ?? null,
       });
-    }
+      const doc = upsertResult.document;
+      await scopedIssueReferencesService.syncDocument(doc.id);
+      const referenceSummaryAfter = await scopedIssueReferencesService.listIssueReferenceSummary(issue.id);
+      const referenceDiff = scopedIssueReferencesService.diffIssueReferenceSummary(referenceSummaryBefore, referenceSummaryAfter);
 
-    res.status(result.created ? 201 : 200).json(doc);
+      await logActivity(scopedDb, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: upsertResult.created ? "issue.document_created" : "issue.document_updated",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          key: doc.key,
+          documentId: doc.id,
+          title: doc.title,
+          format: doc.format,
+          revisionNumber: doc.latestRevisionNumber,
+          ...summarizeIssueReferenceActivityDetails({
+            addedReferencedIssues: referenceDiff.addedReferencedIssues.map(summarizeIssueRelationForActivity),
+            removedReferencedIssues: referenceDiff.removedReferencedIssues.map(summarizeIssueRelationForActivity),
+            currentReferencedIssues: referenceDiff.currentReferencedIssues.map(summarizeIssueRelationForActivity),
+          }),
+        },
+      });
+
+      if (!upsertResult.created) {
+        const expiredInteractions = await scopedIssueThreadInteractionService.expireStaleRequestConfirmationsForIssueDocument(
+          issue,
+          {
+            id: doc.id,
+            key: doc.key,
+            latestRevisionId: doc.latestRevisionId,
+            latestRevisionNumber: doc.latestRevisionNumber,
+          },
+          {
+            agentId: actor.agentId,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+          },
+        );
+        await logExpiredRequestConfirmations({
+          issue,
+          interactions: expiredInteractions,
+          actor,
+          source: "issue.document_updated",
+        }, scopedDb);
+      }
+
+      return upsertResult;
+    });
+
+    res.status(result.created ? 201 : 200).json(result.document);
   });
 
   router.get("/issues/:id/documents/:key/revisions", async (req, res) => {
@@ -1403,61 +1411,69 @@ export function issueRoutes(
       }
 
       const actor = getActorInfo(req);
-      const referenceSummaryBefore = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
-      const result = await documentsSvc.restoreIssueDocumentRevision({
-        issueId: issue.id,
-        key: keyParsed.data,
-        revisionId,
-        createdByAgentId: actor.agentId ?? null,
-        createdByUserId: actor.actorType === "user" ? actor.actorId : null,
-      });
-      await issueReferencesSvc.syncDocument(result.document.id);
-      const referenceSummaryAfter = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
-      const referenceDiff = issueReferencesSvc.diffIssueReferenceSummary(referenceSummaryBefore, referenceSummaryAfter);
+      const result = await withCompanyRls(db, issue.companyId, async (scopedDb) => {
+        const scopedIssueReferencesService = issueReferenceService(scopedDb);
+        const scopedDocumentsService = documentService(scopedDb);
+        const scopedIssueThreadInteractionService = issueThreadInteractionService(scopedDb);
 
-      await logActivity(db, {
-        companyId: issue.companyId,
-        actorType: actor.actorType,
-        actorId: actor.actorId,
-        agentId: actor.agentId,
-        runId: actor.runId,
-        action: "issue.document_restored",
-        entityType: "issue",
-        entityId: issue.id,
-        details: {
-          key: result.document.key,
-          documentId: result.document.id,
-          title: result.document.title,
-          format: result.document.format,
-          revisionNumber: result.document.latestRevisionNumber,
-          restoredFromRevisionId: result.restoredFromRevisionId,
-          restoredFromRevisionNumber: result.restoredFromRevisionNumber,
-          ...summarizeIssueReferenceActivityDetails({
-            addedReferencedIssues: referenceDiff.addedReferencedIssues.map(summarizeIssueRelationForActivity),
-            removedReferencedIssues: referenceDiff.removedReferencedIssues.map(summarizeIssueRelationForActivity),
-            currentReferencedIssues: referenceDiff.currentReferencedIssues.map(summarizeIssueRelationForActivity),
-          }),
-        },
-      });
+        const referenceSummaryBefore = await scopedIssueReferencesService.listIssueReferenceSummary(issue.id);
+        const restoreResult = await scopedDocumentsService.restoreIssueDocumentRevision({
+          issueId: issue.id,
+          key: keyParsed.data,
+          revisionId,
+          createdByAgentId: actor.agentId ?? null,
+          createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+        });
+        await scopedIssueReferencesService.syncDocument(restoreResult.document.id);
+        const referenceSummaryAfter = await scopedIssueReferencesService.listIssueReferenceSummary(issue.id);
+        const referenceDiff = scopedIssueReferencesService.diffIssueReferenceSummary(referenceSummaryBefore, referenceSummaryAfter);
 
-      const expiredInteractions = await issueThreadInteractionService(db).expireStaleRequestConfirmationsForIssueDocument(
-        issue,
-        {
-          id: result.document.id,
-          key: result.document.key,
-          latestRevisionId: result.document.latestRevisionId,
-          latestRevisionNumber: result.document.latestRevisionNumber,
-        },
-        {
+        await logActivity(scopedDb, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
           agentId: actor.agentId,
-          userId: actor.actorType === "user" ? actor.actorId : null,
-        },
-      );
-      await logExpiredRequestConfirmations({
-        issue,
-        interactions: expiredInteractions,
-        actor,
-        source: "issue.document_restored",
+          runId: actor.runId,
+          action: "issue.document_restored",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            key: restoreResult.document.key,
+            documentId: restoreResult.document.id,
+            title: restoreResult.document.title,
+            format: restoreResult.document.format,
+            revisionNumber: restoreResult.document.latestRevisionNumber,
+            restoredFromRevisionId: restoreResult.restoredFromRevisionId,
+            restoredFromRevisionNumber: restoreResult.restoredFromRevisionNumber,
+            ...summarizeIssueReferenceActivityDetails({
+              addedReferencedIssues: referenceDiff.addedReferencedIssues.map(summarizeIssueRelationForActivity),
+              removedReferencedIssues: referenceDiff.removedReferencedIssues.map(summarizeIssueRelationForActivity),
+              currentReferencedIssues: referenceDiff.currentReferencedIssues.map(summarizeIssueRelationForActivity),
+            }),
+          },
+        });
+
+        const expiredInteractions = await scopedIssueThreadInteractionService.expireStaleRequestConfirmationsForIssueDocument(
+          issue,
+          {
+            id: restoreResult.document.id,
+            key: restoreResult.document.key,
+            latestRevisionId: restoreResult.document.latestRevisionId,
+            latestRevisionNumber: restoreResult.document.latestRevisionNumber,
+          },
+          {
+            agentId: actor.agentId,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+          },
+        );
+        await logExpiredRequestConfirmations({
+          issue,
+          interactions: expiredInteractions,
+          actor,
+          source: "issue.document_restored",
+        }, scopedDb);
+
+        return restoreResult;
       });
 
       res.json(result.document);
@@ -1481,55 +1497,64 @@ export function issueRoutes(
       res.status(400).json({ error: "Invalid document key", details: keyParsed.error.issues });
       return;
     }
-    const referenceSummaryBefore = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
-    const removed = await documentsSvc.deleteIssueDocument(issue.id, keyParsed.data);
+    const actor = getActorInfo(req);
+    const removed = await withCompanyRls(db, issue.companyId, async (scopedDb) => {
+      const scopedIssueReferencesService = issueReferenceService(scopedDb);
+      const scopedDocumentsService = documentService(scopedDb);
+      const scopedIssueThreadInteractionService = issueThreadInteractionService(scopedDb);
+
+      const referenceSummaryBefore = await scopedIssueReferencesService.listIssueReferenceSummary(issue.id);
+      const deleted = await scopedDocumentsService.deleteIssueDocument(issue.id, keyParsed.data);
+      if (!deleted) return null;
+      await scopedIssueReferencesService.deleteDocumentSource(deleted.id);
+      const referenceSummaryAfter = await scopedIssueReferencesService.listIssueReferenceSummary(issue.id);
+      const referenceDiff = scopedIssueReferencesService.diffIssueReferenceSummary(referenceSummaryBefore, referenceSummaryAfter);
+
+      await logActivity(scopedDb, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.document_deleted",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          key: deleted.key,
+          documentId: deleted.id,
+          title: deleted.title,
+          ...summarizeIssueReferenceActivityDetails({
+            addedReferencedIssues: referenceDiff.addedReferencedIssues.map(summarizeIssueRelationForActivity),
+            removedReferencedIssues: referenceDiff.removedReferencedIssues.map(summarizeIssueRelationForActivity),
+            currentReferencedIssues: referenceDiff.currentReferencedIssues.map(summarizeIssueRelationForActivity),
+          }),
+        },
+      });
+      const expiredInteractions = await scopedIssueThreadInteractionService.expireStaleRequestConfirmationsForIssueDocument(
+        issue,
+        {
+          id: deleted.id,
+          key: deleted.key,
+          latestRevisionId: null,
+          latestRevisionNumber: null,
+        },
+        {
+          agentId: actor.agentId,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+        },
+      );
+      await logExpiredRequestConfirmations({
+        issue,
+        interactions: expiredInteractions,
+        actor,
+        source: "issue.document_deleted",
+      }, scopedDb);
+      return deleted;
+    });
     if (!removed) {
       res.status(404).json({ error: "Document not found" });
       return;
     }
-    await issueReferencesSvc.deleteDocumentSource(removed.id);
-    const referenceSummaryAfter = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
-    const referenceDiff = issueReferencesSvc.diffIssueReferenceSummary(referenceSummaryBefore, referenceSummaryAfter);
-    const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: issue.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "issue.document_deleted",
-      entityType: "issue",
-      entityId: issue.id,
-      details: {
-        key: removed.key,
-        documentId: removed.id,
-        title: removed.title,
-        ...summarizeIssueReferenceActivityDetails({
-          addedReferencedIssues: referenceDiff.addedReferencedIssues.map(summarizeIssueRelationForActivity),
-          removedReferencedIssues: referenceDiff.removedReferencedIssues.map(summarizeIssueRelationForActivity),
-          currentReferencedIssues: referenceDiff.currentReferencedIssues.map(summarizeIssueRelationForActivity),
-        }),
-      },
-    });
-    const expiredInteractions = await issueThreadInteractionService(db).expireStaleRequestConfirmationsForIssueDocument(
-      issue,
-      {
-        id: removed.id,
-        key: removed.key,
-        latestRevisionId: null,
-        latestRevisionNumber: null,
-      },
-      {
-        agentId: actor.agentId,
-        userId: actor.actorType === "user" ? actor.actorId : null,
-      },
-    );
-    await logExpiredRequestConfirmations({
-      issue,
-      interactions: expiredInteractions,
-      actor,
-      source: "issue.document_deleted",
-    });
     res.json({ ok: true });
   });
 
@@ -2504,20 +2529,24 @@ export function issueRoutes(
         },
       });
 
-      const expiredInteractions = await issueThreadInteractionService(db).expireRequestConfirmationsSupersededByComment(
-        issue,
-        comment,
-        {
-          agentId: actor.agentId,
-          userId: actor.actorType === "user" ? actor.actorId : null,
-        },
+      const expiredInteractions = await withCompanyRls(db, issue.companyId, (scopedDb) =>
+        issueThreadInteractionService(scopedDb).expireRequestConfirmationsSupersededByComment(
+          issue,
+          comment,
+          {
+            agentId: actor.agentId,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+          },
+        ),
       );
-      await logExpiredRequestConfirmations({
-        issue,
-        interactions: expiredInteractions,
-        actor,
-        source: "issue.comment",
-      });
+      await withCompanyRls(db, issue.companyId, (scopedDb) =>
+        logExpiredRequestConfirmations({
+          issue,
+          interactions: expiredInteractions,
+          actor,
+          source: "issue.comment",
+        }, scopedDb),
+      );
 
     } else if (updateReferenceSummaryAfter) {
       issueResponse = {
@@ -2765,13 +2794,29 @@ export function issueRoutes(
     }
     assertCompanyAccess(req, existing.companyId);
     if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
-    const attachments = await svc.listAttachments(id);
-
-    const issue = await svc.remove(id);
-    if (!issue) {
+    const actor = getActorInfo(req);
+    const deleted = await withCompanyRls(db, existing.companyId, async (scopedDb) => {
+      const scopedIssueService = issueService(scopedDb);
+      const attachments = await scopedIssueService.listAttachments(id);
+      const issue = await scopedIssueService.remove(id);
+      if (!issue) return null;
+      await logActivity(scopedDb, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.deleted",
+        entityType: "issue",
+        entityId: issue.id,
+      });
+      return { issue, attachments };
+    });
+    if (!deleted) {
       res.status(404).json({ error: "Issue not found" });
       return;
     }
+    const { issue, attachments } = deleted;
 
     for (const attachment of attachments) {
       try {
@@ -2780,18 +2825,6 @@ export function issueRoutes(
         logger.warn({ err, issueId: id, attachmentId: attachment.id }, "failed to delete attachment object during issue delete");
       }
     }
-
-    const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: issue.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "issue.deleted",
-      entityType: "issue",
-      entityId: issue.id,
-    });
 
     res.json(issue);
   });
@@ -2831,19 +2864,21 @@ export function issueRoutes(
 
     const checkoutRunId = requireAgentRunId(req, res);
     if (req.actor.type === "agent" && !checkoutRunId) return;
-    const updated = await svc.checkout(id, req.body.agentId, req.body.expectedStatuses, checkoutRunId);
     const actor = getActorInfo(req);
-
-    await logActivity(db, {
-      companyId: issue.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "issue.checked_out",
-      entityType: "issue",
-      entityId: issue.id,
-      details: { agentId: req.body.agentId },
+    const updated = await withCompanyRls(db, issue.companyId, async (scopedDb) => {
+      const result = await issueService(scopedDb).checkout(id, req.body.agentId, req.body.expectedStatuses, checkoutRunId);
+      await logActivity(scopedDb, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.checked_out",
+        entityType: "issue",
+        entityId: issue.id,
+        details: { agentId: req.body.agentId },
+      });
+      return result;
     });
 
     if (
@@ -2882,27 +2917,30 @@ export function issueRoutes(
     const actorRunId = requireAgentRunId(req, res);
     if (req.actor.type === "agent" && !actorRunId) return;
 
-    const released = await svc.release(
-      id,
-      req.actor.type === "agent" ? req.actor.agentId : undefined,
-      actorRunId,
-    );
+    const actor = getActorInfo(req);
+    const released = await withCompanyRls(db, existing.companyId, async (scopedDb) => {
+      const result = await issueService(scopedDb).release(
+        id,
+        req.actor.type === "agent" ? req.actor.agentId : undefined,
+        actorRunId,
+      );
+      if (!result) return null;
+      await logActivity(scopedDb, {
+        companyId: result.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.released",
+        entityType: "issue",
+        entityId: result.id,
+      });
+      return result;
+    });
     if (!released) {
       res.status(404).json({ error: "Issue not found" });
       return;
     }
-
-    const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: released.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "issue.released",
-      entityType: "issue",
-      entityId: released.id,
-    });
 
     res.json(released);
   });
@@ -2925,30 +2963,33 @@ export function issueRoutes(
     assertCompanyAccess(req, existing.companyId);
 
     const clearAssignee = req.query.clearAssignee === "true";
-    const result = await svc.adminForceRelease(id, { clearAssignee });
+    const actor = getActorInfo(req);
+    const result = await withCompanyRls(db, existing.companyId, async (scopedDb) => {
+      const forceReleaseResult = await issueService(scopedDb).adminForceRelease(id, { clearAssignee });
+      if (!forceReleaseResult) return null;
+      await logActivity(scopedDb, {
+        companyId: forceReleaseResult.issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.admin_force_release",
+        entityType: "issue",
+        entityId: forceReleaseResult.issue.id,
+        details: {
+          issueId: forceReleaseResult.issue.id,
+          actorUserId: req.actor.userId,
+          prevCheckoutRunId: forceReleaseResult.previous.checkoutRunId,
+          prevExecutionRunId: forceReleaseResult.previous.executionRunId,
+          clearAssignee,
+        },
+      });
+      return forceReleaseResult;
+    });
     if (!result) {
       res.status(404).json({ error: "Issue not found" });
       return;
     }
-
-    const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: result.issue.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "issue.admin_force_release",
-      entityType: "issue",
-      entityId: result.issue.id,
-      details: {
-        issueId: result.issue.id,
-        actorUserId: req.actor.userId,
-        prevCheckoutRunId: result.previous.checkoutRunId,
-        prevExecutionRunId: result.previous.executionRunId,
-        clearAssignee,
-      },
-    });
 
     res.json(result);
   });
@@ -3021,29 +3062,33 @@ export function issueRoutes(
     const agentSourceRunId = req.actor.type === "agent" ? requireAgentRunId(req, res) : null;
     if (req.actor.type === "agent" && !agentSourceRunId) return;
 
-    const interaction = await issueThreadInteractionService(db).create(issue, {
-      ...req.body,
-      sourceRunId: req.actor.type === "agent" ? agentSourceRunId : req.body.sourceRunId ?? null,
-    }, {
-      agentId: actor.agentId,
-      userId: actor.actorType === "user" ? actor.actorId : null,
-    });
+    const interaction = await withCompanyRls(db, issue.companyId, async (scopedDb) => {
+      const created = await issueThreadInteractionService(scopedDb).create(issue, {
+        ...req.body,
+        sourceRunId: req.actor.type === "agent" ? agentSourceRunId : req.body.sourceRunId ?? null,
+      }, {
+        agentId: actor.agentId,
+        userId: actor.actorType === "user" ? actor.actorId : null,
+      });
 
-    await logActivity(db, {
-      companyId: issue.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "issue.thread_interaction_created",
-      entityType: "issue",
-      entityId: issue.id,
-      details: {
-        interactionId: interaction.id,
-        interactionKind: interaction.kind,
-        interactionStatus: interaction.status,
-        continuationPolicy: interaction.continuationPolicy,
-      },
+      await logActivity(scopedDb, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.thread_interaction_created",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          interactionId: created.id,
+          interactionKind: created.kind,
+          interactionStatus: created.status,
+          continuationPolicy: created.continuationPolicy,
+        },
+      });
+
+      return created;
     });
 
     res.status(201).json(interaction);
@@ -3064,63 +3109,72 @@ export function issueRoutes(
       assertBoard(req);
 
       const actor = getActorInfo(req);
-      const { interaction, createdIssues, continuationIssue } = await issueThreadInteractionService(db).acceptInteraction(issue, interactionId, req.body, {
-        agentId: actor.agentId,
-        userId: actor.actorType === "user" ? actor.actorId : null,
-      });
-      const continuationWakeIssue = continuationIssue ?? issue;
+      const { interaction, createdIssues, continuationIssue } = await withCompanyRls(
+        db,
+        issue.companyId,
+        async (scopedDb) => {
+          const scopedInteractionService = issueThreadInteractionService(scopedDb);
+          const accepted = await scopedInteractionService.acceptInteraction(issue, interactionId, req.body, {
+            agentId: actor.agentId,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+          });
 
-      await logActivity(db, {
-        companyId: issue.companyId,
-        actorType: actor.actorType,
-        actorId: actor.actorId,
-        agentId: actor.agentId,
-        runId: actor.runId,
-        action: interaction.status === "expired"
-          ? "issue.thread_interaction_expired"
-          : "issue.thread_interaction_accepted",
-        entityType: "issue",
-        entityId: issue.id,
-        details: {
-          interactionId: interaction.id,
-          interactionKind: interaction.kind,
-          interactionStatus: interaction.status,
-          createdTaskCount:
-            interaction.kind === "suggest_tasks"
-              ? (interaction.result?.createdTasks?.length ?? 0)
-              : 0,
-          skippedTaskCount:
-            interaction.kind === "suggest_tasks"
-              ? (interaction.result?.skippedClientKeys?.length ?? 0)
-              : 0,
-        },
-      });
-
-      if (continuationIssue) {
-        await logActivity(db, {
-          companyId: issue.companyId,
-          actorType: actor.actorType,
-          actorId: actor.actorId,
-          agentId: actor.agentId,
-          runId: actor.runId,
-          action: "issue.updated",
-          entityType: "issue",
-          entityId: issue.id,
-          details: {
-            identifier: issue.identifier,
-            status: continuationIssue.status,
-            assigneeAgentId: continuationIssue.assigneeAgentId ?? null,
-            assigneeUserId: continuationIssue.assigneeUserId ?? null,
-            source: "request_confirmation_accept",
-            interactionId: interaction.id,
-            _previous: {
-              status: issue.status,
-              assigneeAgentId: issue.assigneeAgentId ?? null,
-              assigneeUserId: issue.assigneeUserId ?? null,
+          await logActivity(scopedDb, {
+            companyId: issue.companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            action: accepted.interaction.status === "expired"
+              ? "issue.thread_interaction_expired"
+              : "issue.thread_interaction_accepted",
+            entityType: "issue",
+            entityId: issue.id,
+            details: {
+              interactionId: accepted.interaction.id,
+              interactionKind: accepted.interaction.kind,
+              interactionStatus: accepted.interaction.status,
+              createdTaskCount:
+                accepted.interaction.kind === "suggest_tasks"
+                  ? (accepted.interaction.result?.createdTasks?.length ?? 0)
+                  : 0,
+              skippedTaskCount:
+                accepted.interaction.kind === "suggest_tasks"
+                  ? (accepted.interaction.result?.skippedClientKeys?.length ?? 0)
+                  : 0,
             },
-          },
-        });
-      }
+          });
+
+          if (accepted.continuationIssue) {
+            await logActivity(scopedDb, {
+              companyId: issue.companyId,
+              actorType: actor.actorType,
+              actorId: actor.actorId,
+              agentId: actor.agentId,
+              runId: actor.runId,
+              action: "issue.updated",
+              entityType: "issue",
+              entityId: issue.id,
+              details: {
+                identifier: issue.identifier,
+                status: accepted.continuationIssue.status,
+                assigneeAgentId: accepted.continuationIssue.assigneeAgentId ?? null,
+                assigneeUserId: accepted.continuationIssue.assigneeUserId ?? null,
+                source: "request_confirmation_accept",
+                interactionId: accepted.interaction.id,
+                _previous: {
+                  status: issue.status,
+                  assigneeAgentId: issue.assigneeAgentId ?? null,
+                  assigneeUserId: issue.assigneeUserId ?? null,
+                },
+              },
+            });
+          }
+
+          return accepted;
+        },
+      );
+      const continuationWakeIssue = continuationIssue ?? issue;
 
       for (const createdIssue of createdIssues) {
         void queueIssueAssignmentWakeup({
@@ -3161,33 +3215,37 @@ export function issueRoutes(
       assertBoard(req);
 
       const actor = getActorInfo(req);
-      const interaction = await issueThreadInteractionService(db).rejectInteraction(issue, interactionId, req.body, {
-        agentId: actor.agentId,
-        userId: actor.actorType === "user" ? actor.actorId : null,
-      });
+      const interaction = await withCompanyRls(db, issue.companyId, async (scopedDb) => {
+        const rejected = await issueThreadInteractionService(scopedDb).rejectInteraction(issue, interactionId, req.body, {
+          agentId: actor.agentId,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+        });
 
-      await logActivity(db, {
-        companyId: issue.companyId,
-        actorType: actor.actorType,
-        actorId: actor.actorId,
-        agentId: actor.agentId,
-        runId: actor.runId,
-        action: interaction.status === "expired"
-          ? "issue.thread_interaction_expired"
-          : "issue.thread_interaction_rejected",
-        entityType: "issue",
-        entityId: issue.id,
-        details: {
-          interactionId: interaction.id,
-          interactionKind: interaction.kind,
-          interactionStatus: interaction.status,
-          rejectionReason:
-            interaction.kind === "suggest_tasks"
-              ? (interaction.result?.rejectionReason ?? null)
-              : interaction.kind === "request_confirmation"
-                ? (interaction.result?.reason ?? null)
-              : null,
-        },
+        await logActivity(scopedDb, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          action: rejected.status === "expired"
+            ? "issue.thread_interaction_expired"
+            : "issue.thread_interaction_rejected",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            interactionId: rejected.id,
+            interactionKind: rejected.kind,
+            interactionStatus: rejected.status,
+            rejectionReason:
+              rejected.kind === "suggest_tasks"
+                ? (rejected.result?.rejectionReason ?? null)
+                : rejected.kind === "request_confirmation"
+                  ? (rejected.result?.reason ?? null)
+                  : null,
+          },
+        });
+
+        return rejected;
       });
 
       queueResolvedInteractionContinuationWakeup({
@@ -3217,29 +3275,33 @@ export function issueRoutes(
       assertBoard(req);
 
       const actor = getActorInfo(req);
-      const interaction = await issueThreadInteractionService(db).answerQuestions(issue, interactionId, req.body, {
-        agentId: actor.agentId,
-        userId: actor.actorType === "user" ? actor.actorId : null,
-      });
+      const interaction = await withCompanyRls(db, issue.companyId, async (scopedDb) => {
+        const answered = await issueThreadInteractionService(scopedDb).answerQuestions(issue, interactionId, req.body, {
+          agentId: actor.agentId,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+        });
 
-      await logActivity(db, {
-        companyId: issue.companyId,
-        actorType: actor.actorType,
-        actorId: actor.actorId,
-        agentId: actor.agentId,
-        runId: actor.runId,
-        action: "issue.thread_interaction_answered",
-        entityType: "issue",
-        entityId: issue.id,
-        details: {
-          interactionId: interaction.id,
-          interactionKind: interaction.kind,
-          interactionStatus: interaction.status,
-          answeredQuestionCount:
-            interaction.kind === "ask_user_questions"
-              ? (interaction.result?.answers?.length ?? 0)
-              : 0,
-        },
+        await logActivity(scopedDb, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          action: "issue.thread_interaction_answered",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            interactionId: answered.id,
+            interactionKind: answered.kind,
+            interactionStatus: answered.status,
+            answeredQuestionCount:
+              answered.kind === "ask_user_questions"
+                ? (answered.result?.answers?.length ?? 0)
+                : 0,
+          },
+        });
+
+        return answered;
       });
 
       queueResolvedInteractionContinuationWakeup({
@@ -3263,7 +3325,9 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, issue.companyId);
-    const comment = await svc.getComment(commentId);
+    const comment = await withCompanyRls(db, issue.companyId, (scopedDb) =>
+      issueService(scopedDb).getComment(commentId),
+    );
     if (!comment || comment.issueId !== id) {
       res.status(404).json({ error: "Comment not found" });
       return;
@@ -3309,30 +3373,33 @@ export function issueRoutes(
       return;
     }
 
-    const removed = await svc.removeComment(commentId);
+    const removed = await withCompanyRls(db, issue.companyId, async (scopedDb) => {
+      const deleted = await issueService(scopedDb).removeComment(commentId);
+      if (!deleted) return null;
+      await logActivity(scopedDb, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.comment_cancelled",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          commentId: deleted.id,
+          bodySnippet: deleted.body.slice(0, 120),
+          identifier: issue.identifier,
+          issueTitle: issue.title,
+          source: "queue_cancel",
+          queueTargetRunId: activeRun.id,
+        },
+      });
+      return deleted;
+    });
     if (!removed) {
       res.status(404).json({ error: "Comment not found" });
       return;
     }
-
-    await logActivity(db, {
-      companyId: issue.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "issue.comment_cancelled",
-      entityType: "issue",
-      entityId: issue.id,
-      details: {
-        commentId: removed.id,
-        bodySnippet: removed.body.slice(0, 120),
-        identifier: issue.identifier,
-        issueTitle: issue.title,
-        source: "queue_cancel",
-        queueTargetRunId: activeRun.id,
-      },
-    });
 
     res.json(removed);
   });
@@ -3453,7 +3520,9 @@ export function issueRoutes(
       });
     const hasUnresolvedFirstClassBlockers =
       isBlocked && effectiveMoveToTodoRequested
-        ? (await svc.getDependencyReadiness(issue.id)).unresolvedBlockerCount > 0
+        ? (await withCompanyRls(db, issue.companyId, (scopedDb) =>
+            issueService(scopedDb).getDependencyReadiness(issue.id),
+          )).unresolvedBlockerCount > 0
         : false;
     if (resumeRequested === true && isBlocked && hasUnresolvedFirstClassBlockers) {
       res.status(409).json({ error: "Issue follow-up blocked by unresolved blockers" });
@@ -3463,10 +3532,14 @@ export function issueRoutes(
     let reopenFromStatus: string | null = null;
     let interruptedRunId: string | null = null;
     let currentIssue = issue;
-    const commentReferenceSummaryBefore = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
+    const commentReferenceSummaryBefore = await withCompanyRls(db, issue.companyId, (scopedDb) =>
+      issueReferenceService(scopedDb).listIssueReferenceSummary(issue.id),
+    );
 
     if (effectiveMoveToTodoRequested && (isClosed || (isBlocked && !hasUnresolvedFirstClassBlockers))) {
-      const reopenedIssue = await svc.update(id, { status: "todo" });
+      const reopenedIssue = await withCompanyRls(db, issue.companyId, (scopedDb) =>
+        issueService(scopedDb).update(id, { status: "todo" }),
+      );
       if (!reopenedIssue) {
         res.status(404).json({ error: "Issue not found" });
         return;
@@ -3475,24 +3548,26 @@ export function issueRoutes(
       reopenFromStatus = issue.status;
       currentIssue = reopenedIssue;
 
-      await logActivity(db, {
-        companyId: currentIssue.companyId,
-        actorType: actor.actorType,
-        actorId: actor.actorId,
-        agentId: actor.agentId,
-        runId: actor.runId,
-        action: "issue.updated",
-        entityType: "issue",
-        entityId: currentIssue.id,
-        details: {
-          status: "todo",
-          reopened: true,
-          reopenedFrom: reopenFromStatus,
-          source: "comment",
-          ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
-          identifier: currentIssue.identifier,
-        },
-      });
+      await withCompanyRls(db, issue.companyId, (scopedDb) =>
+        logActivity(scopedDb, {
+          companyId: currentIssue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          action: "issue.updated",
+          entityType: "issue",
+          entityId: currentIssue.id,
+          details: {
+            status: "todo",
+            reopened: true,
+            reopenedFrom: reopenFromStatus,
+            source: "comment",
+            ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
+            identifier: currentIssue.identifier,
+          },
+        }),
+      );
     }
 
     if (interruptRequested) {
@@ -3506,77 +3581,92 @@ export function issueRoutes(
         const cancelled = await heartbeat.cancelRun(runToInterrupt.id);
         if (cancelled) {
           interruptedRunId = cancelled.id;
-          await logActivity(db, {
-            companyId: cancelled.companyId,
-            actorType: actor.actorType,
-            actorId: actor.actorId,
-            agentId: actor.agentId,
-            runId: actor.runId,
-            action: "heartbeat.cancelled",
-            entityType: "heartbeat_run",
-            entityId: cancelled.id,
-            details: { agentId: cancelled.agentId, source: "issue_comment_interrupt", issueId: currentIssue.id },
-          });
+          await withCompanyRls(db, issue.companyId, (scopedDb) =>
+            logActivity(scopedDb, {
+              companyId: cancelled.companyId,
+              actorType: actor.actorType,
+              actorId: actor.actorId,
+              agentId: actor.agentId,
+              runId: actor.runId,
+              action: "heartbeat.cancelled",
+              entityType: "heartbeat_run",
+              entityId: cancelled.id,
+              details: { agentId: cancelled.agentId, source: "issue_comment_interrupt", issueId: currentIssue.id },
+            }),
+          );
         }
       }
     }
 
-    const comment = await svc.addComment(id, req.body.body, {
-      agentId: actor.agentId ?? undefined,
-      userId: actor.actorType === "user" ? actor.actorId : undefined,
-      runId: actor.runId,
+    const { comment, commentReferenceDiff } = await withCompanyRls(db, issue.companyId, async (scopedDb) => {
+      const scopedIssueService = issueService(scopedDb);
+      const scopedIssueReferencesService = issueReferenceService(scopedDb);
+      const createdComment = await scopedIssueService.addComment(id, req.body.body, {
+        agentId: actor.agentId ?? undefined,
+        userId: actor.actorType === "user" ? actor.actorId : undefined,
+        runId: actor.runId,
+      });
+      await scopedIssueReferencesService.syncComment(createdComment.id);
+      const commentReferenceSummaryAfter = await scopedIssueReferencesService.listIssueReferenceSummary(currentIssue.id);
+      return {
+        comment: createdComment,
+        commentReferenceDiff: scopedIssueReferencesService.diffIssueReferenceSummary(
+          commentReferenceSummaryBefore,
+          commentReferenceSummaryAfter,
+        ),
+      };
     });
-    await issueReferencesSvc.syncComment(comment.id);
-    const commentReferenceSummaryAfter = await issueReferencesSvc.listIssueReferenceSummary(currentIssue.id);
-    const commentReferenceDiff = issueReferencesSvc.diffIssueReferenceSummary(
-      commentReferenceSummaryBefore,
-      commentReferenceSummaryAfter,
-    );
 
     if (actor.runId) {
       await heartbeat.reportRunActivity(actor.runId).catch((err) =>
         logger.warn({ err, runId: actor.runId }, "failed to clear detached run warning after issue comment"));
     }
 
-    await logActivity(db, {
-      companyId: currentIssue.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "issue.comment_added",
-      entityType: "issue",
-      entityId: currentIssue.id,
-      details: {
-        commentId: comment.id,
-        bodySnippet: comment.body.slice(0, 120),
-        identifier: currentIssue.identifier,
-        issueTitle: currentIssue.title,
-        ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
-        ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus, source: "comment" } : {}),
-        ...(interruptedRunId ? { interruptedRunId } : {}),
-        ...summarizeIssueReferenceActivityDetails({
-          addedReferencedIssues: commentReferenceDiff.addedReferencedIssues.map(summarizeIssueRelationForActivity),
-          removedReferencedIssues: commentReferenceDiff.removedReferencedIssues.map(summarizeIssueRelationForActivity),
-          currentReferencedIssues: commentReferenceDiff.currentReferencedIssues.map(summarizeIssueRelationForActivity),
-        }),
-      },
-    });
-
-    const expiredInteractions = await issueThreadInteractionService(db).expireRequestConfirmationsSupersededByComment(
-      currentIssue,
-      comment,
-      {
+    await withCompanyRls(db, issue.companyId, (scopedDb) =>
+      logActivity(scopedDb, {
+        companyId: currentIssue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
         agentId: actor.agentId,
-        userId: actor.actorType === "user" ? actor.actorId : null,
-      },
+        runId: actor.runId,
+        action: "issue.comment_added",
+        entityType: "issue",
+        entityId: currentIssue.id,
+        details: {
+          commentId: comment.id,
+          bodySnippet: comment.body.slice(0, 120),
+          identifier: currentIssue.identifier,
+          issueTitle: currentIssue.title,
+          ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
+          ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus, source: "comment" } : {}),
+          ...(interruptedRunId ? { interruptedRunId } : {}),
+          ...summarizeIssueReferenceActivityDetails({
+            addedReferencedIssues: commentReferenceDiff.addedReferencedIssues.map(summarizeIssueRelationForActivity),
+            removedReferencedIssues: commentReferenceDiff.removedReferencedIssues.map(summarizeIssueRelationForActivity),
+            currentReferencedIssues: commentReferenceDiff.currentReferencedIssues.map(summarizeIssueRelationForActivity),
+          }),
+        },
+      }),
     );
-    await logExpiredRequestConfirmations({
-      issue: currentIssue,
-      interactions: expiredInteractions,
-      actor,
-      source: "issue.comment",
-    });
+
+    const expiredInteractions = await withCompanyRls(db, issue.companyId, (scopedDb) =>
+      issueThreadInteractionService(scopedDb).expireRequestConfirmationsSupersededByComment(
+        currentIssue,
+        comment,
+        {
+          agentId: actor.agentId,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+        },
+      ),
+    );
+    await withCompanyRls(db, currentIssue.companyId, (scopedDb) =>
+      logExpiredRequestConfirmations({
+        issue: currentIssue,
+        interactions: expiredInteractions,
+        actor,
+        source: "issue.comment",
+      }, scopedDb),
+    );
 
     // Merge all wakeups from this comment into one enqueue per agent to avoid duplicate runs.
     void (async () => {

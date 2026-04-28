@@ -26,8 +26,14 @@ const mockIssueService = vi.hoisted(() => ({
   markUnread: vi.fn(),
   archiveInbox: vi.fn(),
   unarchiveInbox: vi.fn(),
+  checkout: vi.fn(),
+  release: vi.fn(),
+  adminForceRelease: vi.fn(),
+  remove: vi.fn(),
+  removeComment: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
+  getDependencyReadiness: vi.fn(),
 }));
 
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
@@ -72,12 +78,19 @@ const mockDocumentService = vi.hoisted(() => ({
   listIssueDocuments: vi.fn(async () => []),
   getIssueDocumentByKey: vi.fn(async () => null),
   listIssueDocumentRevisions: vi.fn(async () => []),
+  upsertIssueDocument: vi.fn(),
+  restoreIssueDocumentRevision: vi.fn(),
+  deleteIssueDocument: vi.fn(),
 }));
 const mockExecutionWorkspaceService = vi.hoisted(() => ({
   getById: vi.fn(async () => null),
 }));
 const mockWorkProductService = vi.hoisted(() => ({
   listForIssue: vi.fn(async () => []),
+  createForIssue: vi.fn(),
+  getById: vi.fn(),
+  update: vi.fn(),
+  remove: vi.fn(),
 }));
 const mockIssueReferenceService = vi.hoisted(() => ({
   deleteDocumentSource: vi.fn(async () => undefined),
@@ -94,6 +107,12 @@ const mockIssueReferenceService = vi.hoisted(() => ({
 }));
 const mockIssueThreadInteractionService = vi.hoisted(() => ({
   listForIssue: vi.fn(async () => []),
+  expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
+  acceptInteraction: vi.fn(),
+  rejectInteraction: vi.fn(),
+  answerQuestions: vi.fn(),
+  create: vi.fn(),
+  expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
 }));
 const mockIssueApprovalService = vi.hoisted(() => ({
   listApprovalsForIssue: vi.fn(async () => []),
@@ -249,8 +268,33 @@ describe("issue activity event routes", () => {
     mockIssueService.markUnread.mockResolvedValue(true);
     mockIssueService.archiveInbox.mockResolvedValue({ issueId: "11111111-1111-4111-8111-111111111111", archivedAt: new Date() });
     mockIssueService.unarchiveInbox.mockResolvedValue({ ok: true });
+    mockIssueService.checkout.mockResolvedValue({
+      ...makeIssue(),
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+    });
+    mockIssueService.release.mockResolvedValue({
+      ...makeIssue(),
+      assigneeAgentId: null,
+    });
+    mockIssueService.adminForceRelease.mockResolvedValue({
+      issue: { ...makeIssue(), assigneeAgentId: null },
+      previous: {
+        checkoutRunId: "run-1",
+        executionRunId: "exec-1",
+      },
+    });
+    mockIssueService.remove.mockResolvedValue(makeIssue());
+    mockIssueService.removeComment.mockResolvedValue({
+      id: "comment-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      body: "queued comment",
+      authorUserId: "local-board",
+      authorAgentId: null,
+      createdAt: new Date(),
+    });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
+    mockIssueService.getDependencyReadiness.mockResolvedValue({ unresolvedBlockerCount: 0 });
     mockAccessService.canUser.mockResolvedValue(false);
     mockAccessService.hasPermission.mockResolvedValue(false);
     mockFeedbackService.listIssueVotesForUser.mockResolvedValue([]);
@@ -276,6 +320,104 @@ describe("issue activity event routes", () => {
     mockIssueApprovalService.listApprovalsForIssue.mockResolvedValue([]);
     mockIssueApprovalService.link.mockResolvedValue(undefined);
     mockIssueApprovalService.unlink.mockResolvedValue(undefined);
+    mockIssueThreadInteractionService.acceptInteraction.mockResolvedValue({
+      interaction: {
+        id: "interaction-1",
+        kind: "suggest_tasks",
+        status: "resolved",
+        result: { createdTasks: [], skippedClientKeys: [] },
+      },
+      createdIssues: [],
+      continuationIssue: null,
+    });
+    mockIssueThreadInteractionService.rejectInteraction.mockResolvedValue({
+      id: "interaction-1",
+      kind: "request_confirmation",
+      status: "resolved",
+      result: { reason: "not now" },
+    });
+    mockIssueThreadInteractionService.answerQuestions.mockResolvedValue({
+      id: "interaction-1",
+      kind: "ask_user_questions",
+      status: "answered",
+      result: { answers: [] },
+    });
+    mockIssueThreadInteractionService.create.mockResolvedValue({
+      id: "interaction-new",
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "none",
+    });
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-new",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      body: "Looks good",
+      authorUserId: "local-board",
+      authorAgentId: null,
+      createdAt: new Date(),
+    });
+    mockDocumentService.upsertIssueDocument.mockResolvedValue({
+      created: true,
+      document: {
+        id: "doc-1",
+        issueId: "11111111-1111-4111-8111-111111111111",
+        key: "summary",
+        title: "Summary",
+        format: "markdown",
+        body: "Body",
+        latestRevisionId: "rev-1",
+        latestRevisionNumber: 1,
+      },
+    });
+    mockDocumentService.restoreIssueDocumentRevision.mockResolvedValue({
+      document: {
+        id: "doc-1",
+        issueId: "11111111-1111-4111-8111-111111111111",
+        key: "summary",
+        title: "Summary",
+        format: "markdown",
+        body: "Body",
+        latestRevisionId: "rev-2",
+        latestRevisionNumber: 2,
+      },
+      restoredFromRevisionId: "rev-1",
+      restoredFromRevisionNumber: 1,
+    });
+    mockDocumentService.deleteIssueDocument.mockResolvedValue({
+      id: "doc-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      key: "summary",
+      title: "Summary",
+      format: "markdown",
+    });
+    mockWorkProductService.createForIssue.mockResolvedValue({
+      id: "work-product-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      type: "url",
+      provider: "github",
+    });
+    mockWorkProductService.getById.mockResolvedValue({
+      id: "work-product-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      type: "url",
+      provider: "github",
+    });
+    mockWorkProductService.update.mockResolvedValue({
+      id: "work-product-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      type: "url",
+      provider: "github",
+    });
+    mockWorkProductService.remove.mockResolvedValue({
+      id: "work-product-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      type: "url",
+      provider: "github",
+    });
   });
 
   it("logs blocker activity with added and removed issue summaries", async () => {
@@ -681,5 +823,271 @@ describe("issue activity event routes", () => {
     expect(res.status).toBe(403);
     expect(mockWithCompanyRls).not.toHaveBeenCalled();
     expect(mockIssueApprovalService.listApprovalsForIssue).not.toHaveBeenCalled();
+  });
+
+  it("enters company RLS scope for work-product update/delete", async () => {
+    const issue = { ...makeIssue(), projectId: null };
+    mockIssueService.getById.mockResolvedValue(issue);
+    const app = await createApp();
+
+    const updateRes = await request(app)
+      .patch("/api/work-products/work-product-1")
+      .send({ title: "Updated PR" });
+    expect(updateRes.status).toBe(200);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), "company-1", expect.any(Function));
+    expect(mockWorkProductService.update).toHaveBeenCalledWith("work-product-1", expect.any(Object));
+
+    const deleteRes = await request(app).delete("/api/work-products/work-product-1");
+    expect(deleteRes.status).toBe(200);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), "company-1", expect.any(Function));
+    expect(mockWorkProductService.remove).toHaveBeenCalledWith("work-product-1");
+  });
+
+  it("checks access before entering RLS scope for work-product update", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId: "agent-2",
+      companyId: "company-2",
+      runId: null,
+    });
+    const res = await request(app).patch("/api/work-products/work-product-1").send({ title: "Updated PR" });
+    expect(res.status).toBe(403);
+    expect(mockWithCompanyRls).not.toHaveBeenCalled();
+    expect(mockWorkProductService.update).not.toHaveBeenCalled();
+  });
+
+  it("enters company RLS scope for document upsert/restore/delete mutations", async () => {
+    const issue = makeIssue();
+    mockIssueService.getById.mockResolvedValue(issue);
+    const app = await createApp();
+
+    const upsertRes = await request(app)
+      .put(`/api/issues/${issue.id}/documents/summary`)
+      .send({ format: "markdown", body: "updated body" });
+    expect(upsertRes.status).toBe(201);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), "company-1", expect.any(Function));
+    expect(mockDocumentService.upsertIssueDocument).toHaveBeenCalled();
+
+    const restoreRes = await request(app).post(`/api/issues/${issue.id}/documents/summary/revisions/rev-1/restore`).send({});
+    expect(restoreRes.status).toBe(200);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), "company-1", expect.any(Function));
+    expect(mockDocumentService.restoreIssueDocumentRevision).toHaveBeenCalled();
+
+    const deleteRes = await request(app).delete(`/api/issues/${issue.id}/documents/summary`);
+    expect(deleteRes.status).toBe(200);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), "company-1", expect.any(Function));
+    expect(mockDocumentService.deleteIssueDocument).toHaveBeenCalledWith(issue.id, "summary");
+  });
+
+  it("checks access before entering RLS scope for document upsert", async () => {
+    const issue = makeIssue();
+    mockIssueService.getById.mockResolvedValue(issue);
+    const app = await createApp({
+      type: "agent",
+      agentId: "agent-2",
+      companyId: "company-2",
+      runId: null,
+    });
+    const res = await request(app)
+      .put(`/api/issues/${issue.id}/documents/summary`)
+      .send({ format: "markdown", body: "updated body" });
+    expect(res.status).toBe(403);
+    expect(mockWithCompanyRls).not.toHaveBeenCalled();
+    expect(mockDocumentService.upsertIssueDocument).not.toHaveBeenCalled();
+  });
+
+  it("enters company RLS scope for checkout/release/force-release", async () => {
+    const issue = makeIssue();
+    mockIssueService.getById.mockResolvedValue(issue);
+    const app = await createApp();
+
+    const checkoutRes = await request(app).post(`/api/issues/${issue.id}/checkout`).send({
+      agentId: "33333333-3333-4333-8333-333333333333",
+      expectedStatuses: ["todo"],
+    });
+    expect(checkoutRes.status).toBe(200);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), "company-1", expect.any(Function));
+    expect(mockIssueService.checkout).toHaveBeenCalledWith(
+      issue.id,
+      "33333333-3333-4333-8333-333333333333",
+      ["todo"],
+      null,
+    );
+
+    const releaseRes = await request(app).post(`/api/issues/${issue.id}/release`).send();
+    expect(releaseRes.status).toBe(200);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), "company-1", expect.any(Function));
+    expect(mockIssueService.release).toHaveBeenCalled();
+
+    const forceRes = await request(app).post(`/api/issues/${issue.id}/admin/force-release?clearAssignee=true`).send();
+    expect(forceRes.status).toBe(200);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), "company-1", expect.any(Function));
+    expect(mockIssueService.adminForceRelease).toHaveBeenCalledWith(issue.id, { clearAssignee: true });
+  });
+
+  it("checks access before entering RLS scope for release", async () => {
+    const issue = makeIssue();
+    mockIssueService.getById.mockResolvedValue(issue);
+    const app = await createApp({
+      type: "agent",
+      agentId: "agent-2",
+      companyId: "company-2",
+      runId: "run-2",
+    });
+    const res = await request(app).post(`/api/issues/${issue.id}/release`).send();
+    expect(res.status).toBe(403);
+    expect(mockWithCompanyRls).not.toHaveBeenCalled();
+    expect(mockIssueService.release).not.toHaveBeenCalled();
+  });
+
+  it("enters company RLS scope for interaction decision endpoints", async () => {
+    const issue = makeIssue();
+    mockIssueService.getById.mockResolvedValue(issue);
+    const app = await createApp();
+
+    const acceptRes = await request(app)
+      .post(`/api/issues/${issue.id}/interactions/interaction-1/accept`)
+      .send({});
+    expect(acceptRes.status).toBe(200);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), "company-1", expect.any(Function));
+    expect(mockIssueThreadInteractionService.acceptInteraction).toHaveBeenCalled();
+
+    const rejectRes = await request(app)
+      .post(`/api/issues/${issue.id}/interactions/interaction-1/reject`)
+      .send({ reason: "not now" });
+    expect(rejectRes.status).toBe(200);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), "company-1", expect.any(Function));
+    expect(mockIssueThreadInteractionService.rejectInteraction).toHaveBeenCalled();
+
+    const respondRes = await request(app)
+      .post(`/api/issues/${issue.id}/interactions/interaction-1/respond`)
+      .send({ answers: [] });
+    expect(respondRes.status).toBe(200);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), "company-1", expect.any(Function));
+    expect(mockIssueThreadInteractionService.answerQuestions).toHaveBeenCalled();
+  });
+
+  it("checks board auth before entering RLS scope for interaction accept", async () => {
+    const issue = makeIssue();
+    mockIssueService.getById.mockResolvedValue(issue);
+    const app = await createApp({
+      type: "agent",
+      agentId: "agent-1",
+      companyId: "company-1",
+      runId: "run-1",
+    });
+    const res = await request(app)
+      .post(`/api/issues/${issue.id}/interactions/interaction-1/accept`)
+      .send({});
+    expect(res.status).toBe(403);
+    expect(mockWithCompanyRls).not.toHaveBeenCalled();
+    expect(mockIssueThreadInteractionService.acceptInteraction).not.toHaveBeenCalled();
+  });
+
+  it("enters company RLS scope for interaction create and issue delete", async () => {
+    const issue = makeIssue();
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.listAttachments.mockResolvedValue([]);
+    const app = await createApp();
+
+    const createRes = await request(app).post(`/api/issues/${issue.id}/interactions`).send({
+      kind: "request_confirmation",
+      payload: { version: 1, prompt: "Proceed?" },
+      continuationPolicy: "none",
+    });
+    expect(createRes.status).toBe(201);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), "company-1", expect.any(Function));
+    expect(mockIssueThreadInteractionService.create).toHaveBeenCalled();
+
+    const deleteRes = await request(app).delete(`/api/issues/${issue.id}`);
+    expect(deleteRes.status).toBe(200);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), "company-1", expect.any(Function));
+    expect(mockIssueService.remove).toHaveBeenCalledWith(issue.id);
+  });
+
+  it("checks access before entering RLS scope for issue delete", async () => {
+    const issue = makeIssue();
+    mockIssueService.getById.mockResolvedValue(issue);
+    const app = await createApp({
+      type: "agent",
+      agentId: "agent-2",
+      companyId: "company-2",
+      runId: "run-2",
+    });
+    const res = await request(app).delete(`/api/issues/${issue.id}`);
+    expect(res.status).toBe(403);
+    expect(mockWithCompanyRls).not.toHaveBeenCalled();
+    expect(mockIssueService.remove).not.toHaveBeenCalled();
+  });
+
+  it("enters company RLS scope for queued comment cancel", async () => {
+    const issue = makeIssue();
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.getComment.mockResolvedValue({
+      id: "comment-1",
+      issueId: issue.id,
+      body: "queued comment",
+      authorUserId: "local-board",
+      authorAgentId: null,
+      createdAt: new Date("2026-01-01T00:00:05.000Z"),
+    });
+    mockHeartbeatService.getActiveRunForAgent.mockResolvedValue({
+      id: "run-1",
+      status: "running",
+      agentId: issue.assigneeAgentId,
+      startedAt: new Date("2026-01-01T00:00:00.000Z"),
+      contextSnapshot: { issueId: issue.id },
+    });
+    const app = await createApp();
+
+    const res = await request(app).delete(`/api/issues/${issue.id}/comments/comment-1`);
+    expect(res.status).toBe(200);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), "company-1", expect.any(Function));
+    expect(mockIssueService.removeComment).toHaveBeenCalledWith("comment-1");
+  });
+
+  it("checks access before entering RLS scope for queued comment cancel", async () => {
+    const issue = makeIssue();
+    mockIssueService.getById.mockResolvedValue(issue);
+    const app = await createApp({
+      type: "agent",
+      agentId: "agent-2",
+      companyId: "company-2",
+      runId: "run-2",
+    });
+    const res = await request(app).delete(`/api/issues/${issue.id}/comments/comment-1`);
+    expect(res.status).toBe(403);
+    expect(mockWithCompanyRls).not.toHaveBeenCalled();
+    expect(mockIssueService.removeComment).not.toHaveBeenCalled();
+  });
+
+  it("enters company RLS scope for issue comment add", async () => {
+    const issue = makeIssue();
+    mockIssueService.getById.mockResolvedValue(issue);
+    const app = await createApp();
+
+    const res = await request(app).post(`/api/issues/${issue.id}/comments`).send({ body: "Looks good" });
+    expect(res.status).toBe(201);
+    expect(mockWithCompanyRls).toHaveBeenCalledWith(expect.anything(), "company-1", expect.any(Function));
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      issue.id,
+      "Looks good",
+      expect.objectContaining({ userId: "local-board" }),
+    );
+  });
+
+  it("checks access before entering RLS scope for issue comment add", async () => {
+    const issue = makeIssue();
+    mockIssueService.getById.mockResolvedValue(issue);
+    const app = await createApp({
+      type: "agent",
+      agentId: "agent-2",
+      companyId: "company-2",
+      runId: "run-2",
+    });
+    const res = await request(app).post(`/api/issues/${issue.id}/comments`).send({ body: "Looks good" });
+    expect(res.status).toBe(403);
+    expect(mockWithCompanyRls).not.toHaveBeenCalled();
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
 });
