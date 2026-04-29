@@ -48,6 +48,7 @@ import {
 } from "../services/index.js";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getActorInfo } from "./authz.js";
+import { withCompanyRls } from "../services/company-rls.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectAgentAdapterWorkspaceCommandPaths,
@@ -1504,11 +1505,13 @@ export function agentRoutes(
       runtimeConfig: normalizeNewAgentRuntimeConfig(hireInput.runtimeConfig),
     };
 
-    const company = await db
-      .select()
-      .from(companies)
-      .where(eq(companies.id, companyId))
-      .then((rows) => rows[0] ?? null);
+    const company = await withCompanyRls(db, companyId, (scopedDb) =>
+      scopedDb
+        .select()
+        .from(companies)
+        .where(eq(companies.id, companyId))
+        .then((rows) => rows[0] ?? null),
+    );
     if (!company) {
       res.status(404).json({ error: "Company not found" });
       return;
@@ -1635,11 +1638,13 @@ export function agentRoutes(
     const companyId = req.params.companyId as string;
     await assertCanCreateAgentsForCompany(req, companyId);
 
-    const company = await db
-      .select()
-      .from(companies)
-      .where(eq(companies.id, companyId))
-      .then((rows) => rows[0] ?? null);
+    const company = await withCompanyRls(db, companyId, (scopedDb) =>
+      scopedDb
+        .select()
+        .from(companies)
+        .where(eq(companies.id, companyId))
+        .then((rows) => rows[0] ?? null),
+    );
     if (!company) {
       res.status(404).json({ error: "Company not found" });
       return;
