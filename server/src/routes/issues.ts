@@ -2480,16 +2480,17 @@ export function issueRoutes(
       }
     }
 
-    let comment = null;
+    let comment: Awaited<ReturnType<typeof svc.addComment>> | null = null;
     if (commentBody) {
       const commentReferenceSummaryBefore = updateReferenceSummaryAfter
         ?? await issueReferencesSvc.listIssueReferenceSummary(issue.id);
-      comment = await svc.addComment(id, commentBody, {
+      const createdComment = await svc.addComment(id, commentBody, {
         agentId: actor.agentId ?? undefined,
         userId: actor.actorType === "user" ? actor.actorId : undefined,
         runId: actor.runId,
       });
-      await issueReferencesSvc.syncComment(comment.id);
+      comment = createdComment;
+      await issueReferencesSvc.syncComment(createdComment.id);
       const commentReferenceSummaryAfter = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
       const commentReferenceDiff = issueReferencesSvc.diffIssueReferenceSummary(
         commentReferenceSummaryBefore,
@@ -2513,8 +2514,8 @@ export function issueRoutes(
         entityType: "issue",
         entityId: issue.id,
         details: {
-          commentId: comment.id,
-          bodySnippet: comment.body.slice(0, 120),
+          commentId: createdComment.id,
+          bodySnippet: createdComment.body.slice(0, 120),
           identifier: issue.identifier,
           issueTitle: issue.title,
           ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
@@ -2532,7 +2533,7 @@ export function issueRoutes(
       const expiredInteractions = await withCompanyRls(db, issue.companyId, (scopedDb) =>
         issueThreadInteractionService(scopedDb).expireRequestConfirmationsSupersededByComment(
           issue,
-          comment,
+          createdComment,
           {
             agentId: actor.agentId,
             userId: actor.actorType === "user" ? actor.actorId : null,
